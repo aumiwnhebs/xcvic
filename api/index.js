@@ -647,6 +647,9 @@ app.post('/bot-webhook', async (req, res) => {
 === BALANCE ===
 /add <amount> <userId> — Add balance
 /deduct <amount> <userId> — Remove balance
+/history — All balance changes
+/history <userId> — User balance changes
+/clearhistory — Clear all history
 
 === USDT ===
 /usdt <address> — Set USDT address
@@ -749,8 +752,22 @@ Example:
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
       data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) + amount;
+      const tracked = data.trackedUsers && data.trackedUsers[targetUserId];
+      const currentBal = tracked ? tracked.balance : 'N/A';
+      const updatedBal = currentBal !== 'N/A' ? parseFloat((parseFloat(currentBal) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!data.balanceHistory) data.balanceHistory = [];
+      data.balanceHistory.push({
+        type: 'add',
+        userId: targetUserId,
+        amount: amount,
+        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        originalBalance: currentBal,
+        updatedBalance: updatedBal,
+        time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        phone: (tracked && tracked.phone) || ''
+      });
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}`);
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
       return res.sendStatus(200);
     }
 
@@ -765,9 +782,69 @@ Example:
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
       data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) - amount;
+      const tracked2 = data.trackedUsers && data.trackedUsers[targetUserId];
+      const currentBal2 = tracked2 ? tracked2.balance : 'N/A';
+      const updatedBal2 = currentBal2 !== 'N/A' ? parseFloat((parseFloat(currentBal2) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!data.balanceHistory) data.balanceHistory = [];
+      data.balanceHistory.push({
+        type: 'deduct',
+        userId: targetUserId,
+        amount: amount,
+        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        originalBalance: currentBal2,
+        updatedBalance: updatedBal2,
+        time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        phone: (tracked2 && tracked2.phone) || ''
+      });
       if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}`);
+      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/history' || text.startsWith('/history ')) {
+      const historyTarget = text.startsWith('/history ') ? text.substring(9).trim() : '';
+      const history = data.balanceHistory || [];
+      if (history.length === 0) { await bot.sendMessage(chatId, '📋 No balance history yet.'); return res.sendStatus(200); }
+      const filtered = historyTarget ? history.filter(h => h.userId === historyTarget) : history;
+      if (filtered.length === 0) { await bot.sendMessage(chatId, `📋 No history for user ${historyTarget}`); return res.sendStatus(200); }
+      const userSummary = {};
+      for (const h of filtered) {
+        if (!userSummary[h.userId]) userSummary[h.userId] = { added: 0, deducted: 0, totalNet: 0, phone: h.phone || '', entries: [] };
+        const s = userSummary[h.userId];
+        if (h.type === 'add') s.added += h.amount;
+        else s.deducted += h.amount;
+        s.totalNet = h.totalAdded || 0;
+        if (h.phone) s.phone = h.phone;
+        s.entries.push(h);
+      }
+      let m = '📊 Balance History:\n\n';
+      for (const [uid, s] of Object.entries(userSummary)) {
+        const tracked = data.trackedUsers && data.trackedUsers[uid];
+        const currentBal = tracked ? tracked.balance : 'N/A';
+        m += `👤 User: ${uid}${s.phone ? ' (' + s.phone + ')' : ''}\n`;
+        m += `   ➕ Total Added: ₹${s.added.toFixed(2)}\n`;
+        m += `   ➖ Total Deducted: ₹${s.deducted.toFixed(2)}\n`;
+        m += `   📊 Net Change: ₹${(s.added - s.deducted).toFixed(2)}\n`;
+        m += `   💰 Current Balance: ₹${currentBal}\n`;
+        m += `   📜 Entries:\n`;
+        const recent = s.entries.slice(-10);
+        for (const e of recent) {
+          const icon = e.type === 'add' ? '➕' : '➖';
+          m += `   ${icon} ₹${e.amount} | Bal: ₹${e.updatedBalance} | ${e.time}\n`;
+        }
+        if (s.entries.length > 10) m += `   ... ${s.entries.length - 10} more entries\n`;
+        m += '\n';
+      }
+      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/clearhistory') {
+      data.balanceHistory = [];
+      await saveData(data);
+      await bot.sendMessage(chatId, '🗑 Balance history cleared.');
       return res.sendStatus(200);
     }
 
