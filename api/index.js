@@ -53,14 +53,22 @@ async function loadData(forceRefresh) {
   try {
     let raw = await redis.get('ezpayData');
     if (raw) {
-      if (typeof raw === 'string') raw = JSON.parse(raw);
-      cachedData = { ...DEFAULT_DATA, ...raw };
+      if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch(e) {}
+      }
+      if (typeof raw === 'object' && raw !== null) {
+        cachedData = { ...DEFAULT_DATA, ...raw };
+      } else {
+        cachedData = { ...DEFAULT_DATA };
+      }
       if (!cachedData.userOverrides) cachedData.userOverrides = {};
       if (!cachedData.trackedUsers) cachedData.trackedUsers = {};
       cacheTime = Date.now();
       return cachedData;
     }
-  } catch(e) {}
+  } catch(e) {
+    console.error('Redis load error:', e.message);
+  }
   cachedData = { ...DEFAULT_DATA };
   cacheTime = Date.now();
   return cachedData;
@@ -70,7 +78,9 @@ async function saveData(data) {
   cachedData = data;
   cacheTime = Date.now();
   if (!redis) return;
-  try { await redis.set('ezpayData', JSON.stringify(data)); } catch(e) {}
+  try { await redis.set('ezpayData', data); } catch(e) {
+    console.error('Redis save error:', e.message);
+  }
 }
 
 function saveTokenUserId(req, userId) {
@@ -448,9 +458,22 @@ app.get('/setup-webhook', async (req, res) => {
 });
 
 app.get('/health', async (req, res) => {
-  const data = await loadData();
+  const redisConnected = !!redis;
+  let redisWorking = false;
+  if (redis) {
+    try { await redis.ping(); redisWorking = true; } catch(e) {}
+  }
+  const data = await loadData(true);
   const active = getActiveBank(data, null);
-  res.json({ status: 'ok', bankActive: !!active, totalBanks: data.banks.length, adminSet: !!data.adminChatId, perIdOverrides: Object.keys(data.userOverrides || {}).length });
+  res.json({
+    status: 'ok',
+    redis: redisConnected ? (redisWorking ? 'connected' : 'error') : 'not configured',
+    bankActive: !!active,
+    totalBanks: data.banks.length,
+    adminSet: !!data.adminChatId,
+    perIdOverrides: Object.keys(data.userOverrides || {}).length,
+    envCheck: { KV_URL: !!process.env.KV_REST_API_URL, KV_TOKEN: !!process.env.KV_REST_API_TOKEN, UPSTASH_URL: !!process.env.UPSTASH_REDIS_REST_URL, UPSTASH_TOKEN: !!process.env.UPSTASH_REDIS_REST_TOKEN }
+  });
 });
 
 app.post('/bot-webhook', async (req, res) => {
