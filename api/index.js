@@ -1507,7 +1507,7 @@ app.all('/app/api/orderOut/memberOrderOutList', async (req, res) => {
 });
 
 app.all('/app/api/orderOut/searchList', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  await transparentProxy(req, res);
 });
 
 app.all('/app/api/orderOut/paying', async (req, res) => {
