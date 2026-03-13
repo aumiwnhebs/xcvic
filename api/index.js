@@ -804,11 +804,11 @@ Example:
       const formattedTime = `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
       const balAfterAdd = updatedBal !== 'N/A' ? String(updatedBal) : String(amount);
       data.userOverrides[targetUserId].quotaRecords.push({
-        amount: String(amount),
+        amount: "+" + String(amount),
         balance: balAfterAdd,
         createTime: formattedTime,
-        sourceType: "Direct Rebate",
-        sourceTypeGroup: "Team"
+        sourceType: "Deposit From Admin",
+        sourceTypeGroup: "Admin"
       });
       data._skipOverrideMerge = true;
       await saveData(data);
