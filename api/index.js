@@ -1816,6 +1816,7 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
       };
 
       const targetArr = Array.isArray(listData) ? listData
+        : (listData.lists && Array.isArray(listData.lists)) ? listData.lists
         : (listData.list && Array.isArray(listData.list)) ? listData.list
         : (listData.records && Array.isArray(listData.records)) ? listData.records
         : (listData.rows && Array.isArray(listData.rows)) ? listData.rows
