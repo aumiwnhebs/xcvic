@@ -1243,7 +1243,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       let pwd = encPwd;
       if (encPwd) {
         try {
-          const AES_KEY = 'H85ju78GJ6ti5fDU';
+          const AES_KEY = '8Kjsis90sJnsHys8';
           const keyBytes = Buffer.from(AES_KEY, 'utf8');
           const iv = keyBytes.slice(0, 16);
           const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
