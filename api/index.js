@@ -41,7 +41,7 @@ if (REDIS_URL && REDIS_TOKEN) {
 
 let cachedData = null;
 let cacheTime = 0;
-const CACHE_TTL = 15000;
+const CACHE_TTL = 5000;
 const tokenUserMap = {};
 const userPhoneMap = {};
 let debugNextResponse = false;
@@ -96,21 +96,7 @@ async function saveData(data) {
           }
         }
         if (current.userOverrides) {
-          if (!data.userOverrides) data.userOverrides = {};
-          for (const uid of Object.keys(current.userOverrides)) {
-            const cur = current.userOverrides[uid];
-            const loc = data.userOverrides[uid];
-            if (!loc) {
-              data.userOverrides[uid] = cur;
-            } else {
-              if (cur.addedBalance !== undefined && loc.addedBalance === undefined) {
-                loc.addedBalance = cur.addedBalance;
-              }
-              if (cur.quotaRecords && cur.quotaRecords.length > 0 && (!loc.quotaRecords || loc.quotaRecords.length === 0)) {
-                loc.quotaRecords = cur.quotaRecords;
-              }
-            }
-          }
+          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
         }
         if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
           if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
@@ -1119,6 +1105,7 @@ Example:
     if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI\n(BankName and UPI optional)'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
       const newBank = { accountHolder: parts[0], accountNo: parts[1], ifsc: parts[2], bankName: parts[3] || '', upiId: parts[4] || '' };
       data.banks.push(newBank);
@@ -1130,6 +1117,7 @@ Example:
     }
 
     if (text.startsWith('/removebank ')) {
+      data = await loadData(true);
       const idx = parseInt(text.substring(12).trim()) - 1;
       if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid. /banks se check karo'); return res.sendStatus(200); }
       const removed = data.banks.splice(idx, 1)[0];
@@ -1151,12 +1139,14 @@ Example:
     }
 
     if (text.startsWith('/setbank ')) {
+      data = await loadData(true);
       const idx = parseInt(text.substring(9).trim()) - 1;
       if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid index'); return res.sendStatus(200); }
       data.activeIndex = idx;
       data._skipOverrideMerge = true;
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Active bank #${idx + 1}: ${data.banks[idx].accountHolder}`);
+      const bankInfo = data.banks[idx];
+      await bot.sendMessage(chatId, `✅ Active bank set to #${idx + 1}:\n${bankInfo.accountHolder} | ${bankInfo.accountNo} | ${bankInfo.ifsc}${bankInfo.bankName ? ' | ' + bankInfo.bankName : ''}`);
       return res.sendStatus(200);
     }
 
