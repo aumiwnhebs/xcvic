@@ -1089,7 +1089,11 @@ Example:
       }
 
       const upstreamHeaders = {
-        'apptoken': rawToken,
+        'appToken': rawToken,
+        'packageName': 'com.syq.ez.pay',
+        'version': '1.2.1',
+        'versionCode': '21',
+        'memberCode': uid || '',
         'host': 'api.ezpaycenter.com',
         'content-type': 'application/json;charset=UTF-8',
         'accept': 'application/json, text/plain, */*',
@@ -1165,7 +1169,7 @@ Example:
         return { r, txt, j };
       };
       const headerLine = (label) => `${label}\n━━━━━━━━━━━━━━━━━━\n${uid ? `👤 User: ${uid}${getPhone(data, uid) ? ' (' + getPhone(data, uid) + ')' : ''}\n` : ''}🔑 ${rawToken.substring(0, 20)}...\n`;
-      const respLine = (r, j) => `📊 HTTP: ${r.status} | code: ${j?.code ?? 'N/A'} | msg: ${j?.message ?? j?.msg ?? 'N/A'}`;
+      const respLine = (r, j) => `📊 HTTP: ${r.status} | status: ${j?.status ?? j?.code ?? 'N/A'} | msg: ${j?.message ?? j?.msg ?? 'N/A'}`;
       const truncate = (s) => s.length > 4000 ? s.substring(0, 4000) + '\n... (truncated)' : s;
       const arrFromData = (d) => {
         if (!d) return null;
