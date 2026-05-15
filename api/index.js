@@ -432,6 +432,11 @@ async function proxyFetch(req) {
     fwd[k] = v;
   }
   fwd['host'] = 'api.ezpaycenter.com';
+  // Server enforces minimum app version — APK ships v1.2.1/21 but upstream now
+  // returns `body:true` (silent fail) for anything < v1.2.2/22 on /v2/login.
+  // Force-upgrade version headers so login + all endpoints work.
+  fwd['version'] = '1.2.2';
+  fwd['versioncode'] = '22';
   const opts = { method: req.method, headers: fwd };
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
     opts.body = req.rawBody;
