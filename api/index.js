@@ -435,8 +435,8 @@ async function proxyFetch(req) {
   // Server enforces minimum app version — APK ships v1.2.2/22 but upstream now
   // returns `body:true` (silent fail) for anything < v1.2.2/22 on /v2/login.
   // Force-upgrade version headers so login + all endpoints work.
-  fwd['version'] = '1.2.2';
-  fwd['versioncode'] = '22';
+  fwd['version'] = '1.2.3';
+  fwd['versioncode'] = '23';
   const opts = { method: req.method, headers: fwd };
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
     opts.body = req.rawBody;
@@ -1208,8 +1208,8 @@ Example:
       const upstreamHeaders = {
         'apptoken': rawToken,
         'packagename': 'com.syq.ez.pay',
-        'version': '1.2.2',
-        'versioncode': '22',
+        'version': '1.2.3',
+        'versioncode': '23',
         'membercode': memberCodeHdr,
         'host': 'api.ezpaycenter.com',
         'content-type': 'application/json; charset=utf-8',
