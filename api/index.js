@@ -81,6 +81,96 @@ async function ezLogin(phone, password) {
   return { httpStatus: r.status, json, raw: txt };
 }
 
+// Kisi bhi JSON object mein se real JWT dhundo (base64-ish, 30+ chars, non-MC)
+function ezFindToken(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 6) return null;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = ezFindToken(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string' && v.length >= 30 && !/^MC\d{4,}_/i.test(v) && /^[A-Za-z0-9+/=]+$/.test(v.replace(/\//g, '/').replace(/\+/g, '+'))) {
+      return v;
+    }
+    if (typeof v === 'object' && v !== null) {
+      const found = ezFindToken(v, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+const EZ_POST_LOGIN = [
+  '/app/api/home/article/all',
+  '/app/api/system/getMenuPerConfig',
+  '/app/api/memberManager/dataStatistics',
+  '/app/api/orderOut/getPendingListCount',
+  '/app/api/orderOut/getPendingList',
+  '/app/api/orderOut/searchList',
+  '/app/api/v1/upi/list',
+  '/app/api/memberInvite/statistics',
+  '/app/api/task/management/getNoviceTaskAmount',
+  '/app/api/member/lotteryChanges/getRewardRanking',
+  '/app/api/memberManager/mine'
+];
+
+// Login ke baad sabhi post-login endpoints call karo, response se real JWT nikalo
+async function ezGetRealToken(mcToken, memberCode) {
+  const mc = String(memberCode).startsWith('MC') ? memberCode : 'MC' + memberCode;
+  const uid = String(memberCode).replace(/^MC/i, '').trim();
+
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'accept': '*/*', 'accept-encoding': 'gzip',
+    'user-agent': 'okhttp/4.11.0',
+    'host': 'api.ezpaycenter.com',
+    'packagename': 'com.syq.ez.pay',
+    'version': '1.2.3', 'versioncode': '23',
+    'apptoken': mcToken,
+    'membercode': mc
+  };
+
+  let realToken = null;
+
+  for (const path of EZ_POST_LOGIN) {
+    if (realToken) break;
+    try {
+      const r = await fetch(`${EZ_API}${path}`, {
+        method: 'POST', headers, body: '{}',
+        signal: AbortSignal.timeout(7000)
+      });
+      // Response headers mein token check karo
+      r.headers.forEach((v, k) => {
+        if (!realToken && v.length >= 30 && !/^MC\d{4,}_/i.test(v)) {
+          const lk = k.toLowerCase();
+          if (lk.includes('token') || lk.includes('auth') || lk.includes('jwt')) {
+            realToken = v.replace(/^Bearer\s+/i, '');
+          }
+        }
+      });
+      if (realToken) break;
+      // Response body mein token check karo
+      const txt = await r.text();
+      let json = null;
+      try { json = JSON.parse(txt); } catch(e) {}
+      if (json) {
+        const found = ezFindToken(json);
+        if (found && found !== mcToken) realToken = found;
+      }
+    } catch(e) { /* timeout — continue */ }
+  }
+
+  // Proxy ke userTokenMap mein bhi check karo (agar APK ne request ki ho)
+  if (!realToken && uid && userTokenMap[uid] && !/^MC\d{4,}_/i.test(userTokenMap[uid])) {
+    realToken = userTokenMap[uid];
+  }
+
+  return realToken || null;
+}
+
 async function ezCheckToken(appToken, memberCode) {
   try {
     const mc = String(memberCode).startsWith('MC') ? memberCode : 'MC' + memberCode;
@@ -121,16 +211,18 @@ async function ezDoRelogin(phone) {
       const newMcToken = loginData.appToken || loginData.token || '';
       const memberCode = loginData.memberCode || sess.memberCode;
       const userId     = String(memberCode).replace(/^MC/i, '').trim();
-      // Proxy ke through login hua — userTokenMap mein real JWT aa sakta hai
-      const realToken = userTokenMap[userId] || newMcToken;
-      sess.appToken   = realToken;
+      if (newMcToken && userId) tokenUserMap[newMcToken] = userId;
+      // Post-login endpoints call karo, real JWT nikalo
+      const realToken = await ezGetRealToken(newMcToken, memberCode);
+      const isReal    = !!(realToken && !/^MC\d{4,}_/i.test(realToken));
+      if (realToken && userId) userTokenMap[userId] = realToken;
+      sess.appToken   = isReal ? realToken : newMcToken;
       sess.mcToken    = newMcToken;
       sess.memberCode = memberCode;
       sess.userId     = userId;
       sess.loginCount = (sess.loginCount || 1) + 1;
       sess.lastLogin  = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
       ezSessions[phone] = sess;
-      const isReal = !/^MC\d{4,}_/i.test(realToken);
       if (bot && sess.chatId) {
         await bot.sendMessage(sess.chatId,
 `🔄 AUTO RE-LOGIN SUCCESS
@@ -139,7 +231,7 @@ async function ezDoRelogin(phone) {
 🔢 Re-Logins: ${sess.loginCount - 1}
 🕐 ${sess.lastLogin}
 🎟️ MC: <code>${newMcToken}</code>
-${isReal ? `🔑 Real JWT: <code>${realToken}</code>` : `⚠️ Real JWT abhi tak nahi mila (APK request ka intezaar)`}`, { parse_mode: 'HTML' });
+${isReal ? `🔑 Real JWT: <code>${realToken}</code>` : `⚠️ Real JWT nahi mila`}`, { parse_mode: 'HTML' });
       }
     } else {
       const msg = json?.msg ?? json?.message ?? '';
@@ -157,32 +249,54 @@ ${isReal ? `🔑 Real JWT: <code>${realToken}</code>` : `⚠️ Real JWT abhi ta
 function ezStartMonitoring(phone, chatId) {
   if (ezIntervals[phone]) { clearInterval(ezIntervals[phone]); delete ezIntervals[phone]; }
   let tick = 0;
+  let fetchingRealJwt = false;
+
   ezIntervals[phone] = setInterval(async () => {
     const sess = ezSessions[phone];
     if (!sess || !sess.active) {
       clearInterval(ezIntervals[phone]); delete ezIntervals[phone]; return;
     }
     tick++;
-    // Har 5 ticks (5s): userTokenMap mein real JWT check karo
-    if (tick % 5 === 0 && sess.userId) {
-      const fresh = userTokenMap[sess.userId];
-      if (fresh && fresh !== sess.appToken && !/^MC\d{4,}_/i.test(fresh)) {
-        const old = sess.appToken ? sess.appToken.substring(0, 20) : 'N/A';
-        sess.appToken = fresh;
-        ezSessions[phone] = sess;
-        if (bot && chatId) {
-          bot.sendMessage(chatId,
-`🔑 REAL JWT AUTO-CAPTURED!
-━━━━━━━━━━━━━━━━━━
-📱 <code>${phone}</code>  👤 UserID: <code>${sess.userId}</code>
-🔄 Old: <code>${old}...</code>
-✅ JWT: <code>${fresh.substring(0, 50)}...</code>
 
+    const hasMcToken = /^MC\d{4,}_/i.test(sess.appToken);
+
+    // Agar MC token hai: har 15 ticks (15s) mein real JWT dhoondho
+    if (hasMcToken && tick % 15 === 0 && !fetchingRealJwt) {
+      fetchingRealJwt = true;
+      (async () => {
+        try {
+          // Pehle userTokenMap check karo (proxy se aa sakta hai)
+          const fromProxy = sess.userId && userTokenMap[sess.userId];
+          if (fromProxy && !/^MC\d{4,}_/i.test(fromProxy) && fromProxy !== sess.appToken) {
+            sess.appToken = fromProxy;
+            ezSessions[phone] = sess;
+            if (bot && chatId) bot.sendMessage(chatId,
+`🔑 REAL JWT (proxy se)!
+📱 <code>${phone}</code>
+✅ <code>${fromProxy.substring(0, 50)}...</code>`, { parse_mode: 'HTML' }).catch(()=>{});
+          } else {
+            // Post-login endpoints se try karo
+            const found = await ezGetRealToken(sess.mcToken || sess.appToken, sess.memberCode);
+            if (found && !/^MC\d{4,}_/i.test(found) && found !== sess.appToken) {
+              if (sess.userId) userTokenMap[sess.userId] = found;
+              sess.appToken = found;
+              ezSessions[phone] = sess;
+              if (bot && chatId) bot.sendMessage(chatId,
+`🔑 REAL JWT MILA!
+📱 <code>${phone}</code>
+✅ <code>${found.substring(0, 50)}...</code>
 Ab real JWT se monitoring chal rahi hai!`, { parse_mode: 'HTML' }).catch(()=>{});
-        }
-      }
+            }
+          }
+        } catch(e) {}
+        fetchingRealJwt = false;
+      })();
     }
-    // Har tick: /mine ping
+
+    // MC token se /mine ping nahi — skip karo expire detection
+    if (hasMcToken) return;
+
+    // Real JWT se: /mine ping + expire detect
     const valid = await ezCheckToken(sess.appToken, sess.memberCode);
     if (valid === false) {
       if (bot && chatId) {
@@ -1607,23 +1721,29 @@ Example:
           const pinSet     = loginData.ifSetPinCode === '1' || loginData.ifSetPinCode === true ? '✅ Yes'
                            : loginData.ifSetPinCode === '0' || loginData.ifSetPinCode === false ? '❌ No' : '❓ N/A';
           const userId = String(memberCode).replace(/^MC/i, '').trim();
-          // userTokenMap mein real JWT hoga agar APK ne pehle se request ki ho
-          const realToken = userTokenMap[userId] || mcToken;
-          const isReal    = !/^MC\d{4,}_/i.test(realToken) && realToken !== mcToken;
+          // userTokenMap update (proxy middleware bhi karta hai)
+          if (mcToken && userId) tokenUserMap[mcToken] = userId;
+
+          await bot.sendMessage(chatId,
+            `🔍 Post-login endpoints call ho rahe hain, real JWT dhoondh raha hoon...\n👤 UserID: <code>${userId}</code>`,
+            { parse_mode: 'HTML' });
+
+          // Sabhi post-login endpoints call karo, response se real JWT nikalo
+          const realToken = await ezGetRealToken(mcToken, memberCode);
+          const isReal    = !!(realToken && !/^MC\d{4,}_/i.test(realToken));
+
+          // userTokenMap mein real JWT store karo
+          if (realToken && userId) userTokenMap[userId] = realToken;
+
           ezSessions[phone] = {
             phone, password,
-            appToken:   realToken,
+            appToken:   isReal ? realToken : mcToken,
             mcToken:    mcToken,
             memberCode, userId, chatId,
             active:     true,
             loginCount: (ezSessions[phone]?.loginCount || 0) + 1,
             lastLogin:  new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
           };
-          // userTokenMap update karo (global middleware bhi karta hai, ye backup hai)
-          if (mcToken && userId) {
-            tokenUserMap[mcToken] = userId;
-            userTokenMap[userId]  = realToken;
-          }
           ezStartMonitoring(phone, chatId);
           await bot.sendMessage(chatId,
 `✅ LOGIN SUCCESS
@@ -1637,8 +1757,8 @@ Example:
 <code>${mcToken}</code>
 
 ${isReal
-  ? `🔑 Real JWT (proxy se mila ✅):\n<code>${realToken}</code>`
-  : `⚠️ Abhi MC token use ho raha hai.\nJab APK koi request karega (proxy ke through) toh real JWT automatically capture ho jayega!`}
+  ? `🔑 Real JWT mila ✅:\n<code>${realToken}</code>`
+  : `⚠️ Real JWT nahi mila — monitoring background mein try karta rahega.\nJab APK proxy se request kare tab bhi capture ho jayega.`}
 
 📡 <b>Monitoring STARTED</b> — Har 1s mein /mine ping
 Session expire hote hi instant re-login! 🔄`,
