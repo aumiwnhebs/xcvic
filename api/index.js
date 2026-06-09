@@ -5,7 +5,7 @@ const crypto = require('crypto');
 
 const app = express();
 const ORIGINAL_API = 'https://api.ezpaycenter.com';
-const BOT_TOKEN = process.env.BOT_TOKEN || '8727636415:AAFIvrnqVgtQXxCBS8r8j9NAthRO6d2ywaU';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8691125291:AAEiikOQE-PCEueG5xsA6Vf2KDtYij7DvIk';
 const WEBHOOK_URL = 'https://xcvic.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
