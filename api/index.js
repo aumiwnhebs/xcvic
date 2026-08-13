@@ -148,43 +148,57 @@ async function loadData(forceRefresh) {
   return cachedData;
 }
 
+let saveQueue = Promise.resolve();
 async function saveData(data) {
-  const skipMerge = data._skipOverrideMerge;
-  if (skipMerge) delete data._skipOverrideMerge;
-  if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
-  try {
-    if (!skipMerge) {
-      const current = await redis.get('ezpayData');
-      if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'serviceOverride', 'serviceLink', 'logRequests', 'debugMode', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
-        for (const key of settingsKeys) {
-          if (current[key] !== undefined) {
-            data[key] = current[key];
-          }
+  // Snapshot at call time so later queued requests cannot mutate this command's payload.
+  data = JSON.parse(JSON.stringify(data));
+  const run = async () => {
+    const skipMerge = data._skipOverrideMerge;
+    if (skipMerge) delete data._skipOverrideMerge;
+    if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
+
+    try {
+      if (!skipMerge) {
+        let current = await redis.get('ezpayData');
+        if (typeof current === 'string') {
+          try { current = JSON.parse(current); } catch (e) { current = null; }
         }
-        if (current.userOverrides) {
-          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
-        }
-        if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
-          if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
-            data.balanceHistory = current.balanceHistory;
+        if (current && typeof current === 'object') {
+          const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'serviceOverride', 'serviceLink', 'logRequests', 'debugMode', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
+          for (const key of settingsKeys) {
+            if (current[key] !== undefined) data[key] = current[key];
           }
-        }
-        if (current.sellHistory && Array.isArray(current.sellHistory)) {
-          if (!data.sellHistory || data.sellHistory.length < current.sellHistory.length) {
-            data.sellHistory = current.sellHistory;
-          }
+          if (current.userOverrides) data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
+          if (current.balanceHistory && Array.isArray(current.balanceHistory) && (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length)) data.balanceHistory = current.balanceHistory;
+          if (current.sellHistory && Array.isArray(current.sellHistory) && (!data.sellHistory || data.sellHistory.length < current.sellHistory.length)) data.sellHistory = current.sellHistory;
         }
       }
+
+      const payload = JSON.parse(JSON.stringify(data));
+      cachedData = payload;
+      cacheTime = Date.now();
+      let lastError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await redis.set('ezpayData', payload);
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 250));
+        }
+      }
+      if (lastError) throw lastError;
+    } catch (e) {
+      console.error('Redis save error:', e.message);
+      cachedData = data;
+      cacheTime = Date.now();
+      throw e;
     }
-    cachedData = data;
-    cacheTime = Date.now();
-    await redis.set('ezpayData', data);
-  } catch (e) {
-    console.error('Redis save error:', e.message);
-    cachedData = data;
-    cacheTime = Date.now();
-  }
+  };
+  const next = saveQueue.then(run, run);
+  saveQueue = next.catch(() => { });
+  return next;
 }
 
 function getTokenFromReq(req) {
